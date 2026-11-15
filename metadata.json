@@ -1,0 +1,6 @@
+{
+  "name": "Solarithm Reach",
+  "description": "Enterprise telecalling and sales lead management console for high-volume solar sales pipelines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

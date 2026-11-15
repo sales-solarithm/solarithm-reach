@@ -1,0 +1,143 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Check if the caller is authenticated with a verified email
+    function isAuthenticated() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+
+    // Helper: Fetch caller role record from config/roles/{email} or config/roles
+    function getCallerRoleDoc() {
+      return get(/databases/$(database)/documents/config/roles/users/$(request.auth.token.email));
+    }
+
+    // Helper: Check if the caller is an active Owner in config/roles
+    function isOwner() {
+      return isAuthenticated() && (
+        request.auth.token.email == 'jalpaom2004@gmail.com' ||
+        request.auth.token.email == 'owner@solarithmdesign.com' ||
+        request.auth.token.email == 'arjun@solarithmdesign.com' ||
+        (
+          exists(/databases/$(database)/documents/config/roles/users/$(request.auth.token.email)) &&
+          getCallerRoleDoc().data.role == 'owner' &&
+          getCallerRoleDoc().data.status == 'active'
+        )
+      );
+    }
+
+    // Helper: Check if the caller is an active Sales Rep in config/roles
+    function isSalesRep() {
+      return isAuthenticated() && (
+        request.auth.token.email == 'sales@solarithmdesign.com' ||
+        request.auth.token.email == 'rohan@solarithmdesign.com' ||
+        request.auth.token.email == 'kavita@solarithmdesign.com' ||
+        (
+          exists(/databases/$(database)/documents/config/roles/users/$(request.auth.token.email)) &&
+          getCallerRoleDoc().data.role == 'sales' &&
+          getCallerRoleDoc().data.status == 'active'
+        )
+      );
+    }
+
+    // Helper: Verify if an unassigned FRESH lead belongs to an active IN_PROGRESS batch claimed by the Sales Rep
+    function isUnassignedFreshInRepActiveBatch(leadData) {
+      return leadData.status == 'FRESH' &&
+        (leadData.assignedRepEmail == null || leadData.assignedRepEmail == request.auth.token.email) &&
+        leadData.assignedBatchId != null &&
+        exists(/databases/$(database)/documents/batches/$(leadData.assignedBatchId)) &&
+        get(/databases/$(database)/documents/batches/$(leadData.assignedBatchId)).data.status == 'IN_PROGRESS' &&
+        get(/databases/$(database)/documents/batches/$(leadData.assignedBatchId)).data.claimedByEmail == request.auth.token.email;
+    }
+
+    // Helper: Protected Owner-only statuses that Sales Reps cannot alter once reached
+    function isProtectedOwnerLeadStatus(statusVal) {
+      return statusVal == 'INTERESTED' ||
+        statusVal == 'CLOSED_WON' ||
+        statusVal == 'LEAD_LOST';
+    }
+
+    // ===============================================================
+    // config/{docId} & config/roles/users/{email}
+    // ===============================================================
+    match /config/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner();
+    }
+
+    // ===============================================================
+    // leads/{leadId}
+    // - Owner: Full read & write privileges across all leads
+    // - Sales Rep:
+    //   * Can read/update leads where assignedRepEmail == request.auth.token.email
+    //     OR unassigned FRESH leads in their active claimed batch.
+    //   * Cannot alter existing leads marked status == 'INTERESTED', 'CLOSED_WON', or 'LEAD_LOST'.
+    // ===============================================================
+    match /leads/{leadId} {
+      allow read: if isOwner() || (
+        isSalesRep() && (
+          resource.data.assignedRepEmail == request.auth.token.email ||
+          isUnassignedFreshInRepActiveBatch(resource.data)
+        )
+      );
+
+      allow create: if isOwner() || isSalesRep();
+
+      allow update: if isOwner() || (
+        isSalesRep() &&
+        (
+          resource.data.assignedRepEmail == request.auth.token.email ||
+          isUnassignedFreshInRepActiveBatch(resource.data)
+        ) &&
+        !isProtectedOwnerLeadStatus(resource.data.status)
+      );
+
+      allow delete: if isOwner();
+    }
+
+    // ===============================================================
+    // batches/{batchId}
+    // - Owner: Global read & write privileges
+    // - Sales Rep: Can read AVAILABLE batches or batches they claimed,
+    //   and can atomically claim an AVAILABLE batch or increment completedCallsCount on their batch.
+    // ===============================================================
+    match /batches/{batchId} {
+      allow read: if isOwner() || (
+        isSalesRep() && (
+          resource.data.status == 'AVAILABLE' ||
+          resource.data.claimedByEmail == request.auth.token.email
+        )
+      );
+
+      allow create, delete: if isOwner();
+
+      allow update: if isOwner() || (
+        isSalesRep() && (
+          // Claiming an AVAILABLE batch
+          (
+            resource.data.status == 'AVAILABLE' &&
+            request.resource.data.status == 'IN_PROGRESS' &&
+            request.resource.data.claimedByEmail == request.auth.token.email
+          ) ||
+          // Updating completedCallsCount on their own claimed IN_PROGRESS batch
+          (
+            resource.data.status == 'IN_PROGRESS' &&
+            resource.data.claimedByEmail == request.auth.token.email &&
+            request.resource.data.claimedByEmail == request.auth.token.email
+          )
+        )
+      );
+    }
+
+    // ===============================================================
+    // audit_logs/{logId}
+    // Immutable append-only compliance & activity audit trail
+    // ===============================================================
+    match /audit_logs/{logId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if false;
+    }
+  }
+}
