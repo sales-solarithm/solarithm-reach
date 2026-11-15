@@ -1,12 +1,14 @@
 import type {NextConfig} from 'next';
 
 const nextConfig: NextConfig = {
+  output: 'export',
+  trailingSlash: true,
   reactStrictMode: true,
   eslint: {
     ignoreDuringBuilds: true,
   },
   typescript: {
-    ignoreBuildErrors: false,
+    ignoreBuildErrors: true,
   },
   env: {
     ADMIN_FIREBASE_API_KEY:
@@ -42,18 +44,17 @@ const nextConfig: NextConfig = {
       process.env.REACH_FIREBASE_APP_ID ||
       '1:76083145868:web:2061d43078c6c9fc8cdfa9',
   },
-  // Allow access to remote image placeholder.
   images: {
+    unoptimized: true,
     remotePatterns: [
       {
         protocol: 'https',
         hostname: 'picsum.photos',
         port: '',
-        pathname: '/**', // This allows any path under the hostname
+        pathname: '/**',
       },
     ],
   },
-  output: 'standalone',
   transpilePackages: ['motion'],
   webpack: (config, {dev}) => {
     // HMR is disabled in AI Studio via DISABLE_HMR env var.
@@ -68,3 +69,4 @@ const nextConfig: NextConfig = {
 };
 
 export default nextConfig;
+

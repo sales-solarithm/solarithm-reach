@@ -12,7 +12,7 @@ import {
   parseLeadDealValueInr,
   parseLeadSolarCapacityKw,
   renderWeeklyDigestHtml,
-} from '../functions/src/cron/weeklyDigest';
+} from './weeklyDigest';
 import { INITIAL_AUTHORIZED_USERS, INITIAL_LEADS } from './seedData';
 import { LeadRecord } from './types';
 

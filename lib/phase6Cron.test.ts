@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runMidnightResetPure } from '@/functions/src/cron/midnightReset';
-import { runCooldownSweeperPure } from '@/functions/src/cron/cooldownSweeper';
+import {
+  runMidnightResetPure,
+  runCooldownSweeperPure,
+} from '@/lib/batchResetCron';
 import { LeadRecord } from '@/lib/types';
 import { DailyBatchDocument } from '@/types/batch';
 

@@ -9,9 +9,9 @@ import {
   claimBatchStateTransition,
   createDailyBatchPure,
   filterBatchesForUser,
+  runMidnightResetPure,
   runNightlySweepPure,
 } from './batchResetCron';
-import { runMidnightResetPure } from './../functions/src/cron/midnightReset';
 import { LeadRecord } from './types';
 
 function makeTestLead(

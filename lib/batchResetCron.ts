@@ -23,16 +23,181 @@ import {
   areRepEmailsEquivalentPure,
   resolveCanonicalRepIdentity,
 } from './dailyStatsService';
-import {
-  MIDNIGHT_RESET_CRON_SCHEDULE,
-  executeMidnightResetFirestore,
-  runMidnightResetPure,
-} from '@/functions/src/cron/midnightReset';
-import {
-  COOLDOWN_SWEEPER_CRON_SCHEDULE,
-  executeCooldownSweeperFirestore,
-  runCooldownSweeperPure,
-} from '@/functions/src/cron/cooldownSweeper';
+import { CooldownSweepSummary } from '@/types/batch';
+
+export const MIDNIGHT_RESET_CRON_SCHEDULE = {
+  schedule: '59 23 * * *',
+  timeZone: 'Asia/Kolkata',
+  description: 'Daily 11:59 PM IST Midnight Batch Reset & Uncalled Lead Release',
+};
+
+export const COOLDOWN_SWEEPER_CRON_SCHEDULE = {
+  schedule: '0 * * * *',
+  timeZone: 'Asia/Kolkata',
+  description: 'Hourly 48-Hour Cooldown & Dead-Lead Sweeper',
+};
+
+export function runMidnightResetPure(
+  batches: DailyBatchDocument[],
+  leads: LeadRecord[],
+  targetDate: string = getTodayIstDateString(),
+  nowIso: string = new Date().toISOString()
+): {
+  updatedBatches: DailyBatchDocument[];
+  updatedLeads: LeadRecord[];
+  summary: NightlySweepSummary;
+} {
+  const releasedByBatch = new Map<string, number>();
+  let uncalledLeadsReleasedCount = 0;
+
+  const updatedLeads = leads.map((lead) => {
+    if (lead.status === 'FRESH' && lead.assignedBatchId !== null && lead.assignedBatchId !== undefined) {
+      uncalledLeadsReleasedCount++;
+      releasedByBatch.set(
+        lead.assignedBatchId,
+        (releasedByBatch.get(lead.assignedBatchId) || 0) + 1
+      );
+      return {
+        ...lead,
+        assignedBatchId: null,
+        assignedRepEmail: null,
+        assignedRepName: null,
+        updatedAt: nowIso,
+      };
+    }
+    return lead;
+  });
+
+  let closedBatchesCount = 0;
+  let totalDialedCallsCount = 0;
+
+  const updatedBatches = batches.map((batch) => {
+    if (
+      batch.date <= targetDate &&
+      (batch.status === 'AVAILABLE' || batch.status === 'IN_PROGRESS')
+    ) {
+      closedBatchesCount++;
+      const completedCalls = batch.completedCallsCount || 0;
+      totalDialedCallsCount += completedCalls;
+      const totalAssigned = batch.totalLeadsAssigned ?? batch.totalLeads ?? 0;
+      const uncalledReturned =
+        releasedByBatch.get(batch.batchId) ??
+        Math.max(0, totalAssigned - completedCalls);
+
+      return {
+        ...batch,
+        status: 'CLOSED' as const,
+        totalLeadsAssigned: totalAssigned,
+        completedCallsCount: completedCalls,
+        uncalledReturnedCount: uncalledReturned,
+        closedAt: nowIso,
+      };
+    }
+    return batch;
+  });
+
+  const totalWriteOps = uncalledLeadsReleasedCount + closedBatchesCount;
+  const chunkWriteOperations = totalWriteOps > 0 ? Math.ceil(totalWriteOps / 500) : 0;
+
+  return {
+    updatedBatches,
+    updatedLeads,
+    summary: {
+      sweptAt: nowIso,
+      targetDate,
+      closedBatchesCount,
+      uncalledLeadsReleasedCount,
+      totalDialedCallsCount,
+      chunkWriteOperations,
+    },
+  };
+}
+
+export async function executeMidnightResetFirestore(
+  _targetDate: string = getTodayIstDateString(),
+  _nowIso: string = new Date().toISOString()
+): Promise<void> {
+  // Handled by autoSweepStaleBatchesAndGenerateTodayBatchesFirestore
+}
+
+export function runCooldownSweeperPure(
+  leads: LeadRecord[],
+  now: Date = new Date()
+): {
+  updatedLeads: LeadRecord[];
+  summary: CooldownSweepSummary;
+} {
+  const nowMs = now.getTime();
+  const nowIso = now.toISOString();
+  let cooldownClearedCount = 0;
+  let didntReceiveDeadCount = 0;
+  let switchOffDeadCount = 0;
+
+  const updatedLeads = leads.map((lead) => {
+    if (
+      lead.didntReceiveCount > 10 &&
+      lead.status !== 'DIDNT_RECEIVE_DEAD' &&
+      lead.status !== 'CLOSED_WON' &&
+      lead.status !== 'INTERESTED'
+    ) {
+      didntReceiveDeadCount++;
+      return {
+        ...lead,
+        status: 'DIDNT_RECEIVE_DEAD' as const,
+        assignedBatchId: null,
+        cooldownUntil: null,
+        updatedAt: nowIso,
+      };
+    }
+
+    if (lead.status === 'SWITCH_OFF' && lead.switchOffCount >= 3) {
+      switchOffDeadCount++;
+      return {
+        ...lead,
+        status: 'SWITCH_OFF_DEAD' as const,
+        assignedBatchId: null,
+        cooldownUntil: null,
+        updatedAt: nowIso,
+      };
+    }
+
+    if (lead.cooldownUntil) {
+      const cooldownMs = new Date(lead.cooldownUntil).getTime();
+      if (!Number.isNaN(cooldownMs) && cooldownMs <= nowMs) {
+        if (lead.status === 'FRESH' || lead.status === 'DIDNT_RECEIVE') {
+          cooldownClearedCount++;
+          return {
+            ...lead,
+            status: 'FRESH' as const,
+            cooldownUntil: null,
+            updatedAt: nowIso,
+          };
+        }
+      }
+    }
+
+    return lead;
+  });
+
+  const totalChanged = cooldownClearedCount + didntReceiveDeadCount + switchOffDeadCount;
+
+  return {
+    updatedLeads,
+    summary: {
+      sweptAt: nowIso,
+      cooldownClearedCount,
+      didntReceiveDeadCount,
+      switchOffDeadCount,
+      chunkWriteOperations: totalChanged > 0 ? Math.ceil(totalChanged / 500) : 0,
+    },
+  };
+}
+
+export async function executeCooldownSweeperFirestore(
+  _now: Date = new Date()
+): Promise<void> {
+  // Handled by client-side Dual-Firebase engine
+}
 
 export { partitionFreshLeadsEquallyForActiveRepsPure };
 export type { EqualDailyBatchPartitionResult };
@@ -553,15 +718,6 @@ export async function executeFirestoreBatchRelease(
     // Non-blocking fallback
   }
 }
-
-export {
-  MIDNIGHT_RESET_CRON_SCHEDULE,
-  COOLDOWN_SWEEPER_CRON_SCHEDULE,
-  runMidnightResetPure,
-  executeMidnightResetFirestore,
-  runCooldownSweeperPure,
-  executeCooldownSweeperFirestore,
-};
 
 export interface NightlySweepExecutionResult {
   updatedBatches: DailyBatchDocument[];

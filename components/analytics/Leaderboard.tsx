@@ -25,7 +25,7 @@ import {
   executeWeeklyDigestFirestore,
   generateWeeklyDigestPayloadPure,
   renderWeeklyDigestHtml,
-} from '@/functions/src/cron/weeklyDigest';
+} from '@/lib/weeklyDigest';
 
 export type LeaderboardTimeFilter =
   | 'TODAY'

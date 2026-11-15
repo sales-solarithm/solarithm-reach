@@ -1084,42 +1084,18 @@ export function PipelineConsole() {
     );
   };
 
-  // Trigger Call Action & Gemini AI Pitch Drawer (Acquires 10-minute Soft Lock via useLeadLock)
+  // Trigger Call Action & Pitch Drawer (Acquires 10-minute Soft Lock via useLeadLock)
   const handleOpenPitchBrief = async (lead: LeadRecord) => {
     setSelectedLeadForPitch(lead);
     setDrawerDisposition(lead.status === 'FRESH' ? 'INTERESTED' : lead.status);
     setDrawerCallNotes(lead.notes || '');
-    setPitchBrief(null);
-    setIsGeneratingPitch(true);
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1200);
-      const res = await fetch('/api/gemini/pitch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          companyName: lead.companyName,
-          city: lead.city,
-          state: lead.state,
-          status: lead.status,
-          notes: lead.notes,
-          callAttempts: lead.callAttempts,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      const data = await res.json();
-      setPitchBrief(data);
-    } catch {
-      setPitchBrief({
-        openingHook: `Speaking with the Facility / Energy Head at ${lead.companyName}? We help industrial units in ${lead.city || lead.state || 'India'} cut HT power costs by 45% via captive solar.`,
-        estimatedCapacityKw: '500 kWp – 1.2 MWp Industrial Rooftop',
-        keyValueProp: '3.1-year CAPEX payback with 40% accelerated depreciation benefit.',
-        objectionRebuttal: 'Full DISCOM net-metering and CEIG statutory approvals handled turnkey.',
-      });
-    } finally {
-      setIsGeneratingPitch(false);
-    }
+    setIsGeneratingPitch(false);
+    setPitchBrief({
+      openingHook: `Speaking with the Facility / Energy Head at ${lead.companyName}? We help industrial units in ${lead.city || lead.state || 'India'} cut HT power costs by 45% via captive solar.`,
+      estimatedCapacityKw: '500 kWp – 1.2 MWp Industrial Rooftop',
+      keyValueProp: '3.1-year CAPEX payback with 40% accelerated depreciation benefit.',
+      objectionRebuttal: 'Full DISCOM net-metering and CEIG statutory approvals handled turnkey.',
+    });
   };
 
   // Filtered leads based on role + activeTab + activeBatchIdFilter + searchQuery + statusFilter
