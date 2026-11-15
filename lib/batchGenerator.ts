@@ -2,21 +2,24 @@ import {
   collection,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
+  getDocsFromServer,
   query,
   setDoc,
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { hasLiveReachFirebaseConfig, reachDb as db } from './firebaseDual';
+import {
+  hasLiveReachFirebaseConfig,
+  reachDb as db,
+  reportCloudSyncError,
+} from './firebaseDual';
 import { getActiveSalesReps } from './employeeQueries';
 import { sanitizeFirestorePayload } from './firestoreSanitizer';
 import {
   isLegacyMockBatch,
   isLegacyMockOrSyntheticLead,
-  loadLocalBatches,
-  loadLocalLeads,
-  saveLocalBatches,
 } from './leadStore';
 import { LeadRecord } from './types';
 import {
@@ -33,28 +36,14 @@ export const REVIVED_QUOTA_MAX_RATIO = 0.1;
 export const COOLDOWN_HOURS = 48;
 export const DAILY_STATE_STORAGE_KEY = 'solarithm_reach_daily_state_v1';
 
+let memoryDailyStateMeta: DailyStateMetaDocument | null = null;
+
 export function loadLocalDailyStateMeta(): DailyStateMetaDocument | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    const raw = window.localStorage.getItem(DAILY_STATE_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as DailyStateMetaDocument;
-    if (parsed && typeof parsed.activeDate === 'string') {
-      return parsed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
+  return memoryDailyStateMeta;
 }
 
 export function saveLocalDailyStateMeta(state: DailyStateMetaDocument): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(DAILY_STATE_STORAGE_KEY, JSON.stringify(state));
-  } catch {
-    // ignore storage errors
-  }
+  memoryDailyStateMeta = state;
 }
 
 export interface StratifiedBatchResult {
@@ -611,12 +600,16 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
   try {
     const [dailyStateSnap, activeReps, batchesSnap, freshLeadsSnap] =
       await Promise.all([
-        getDoc(dailyStateRef).catch(() => null),
+        getDocFromServer(dailyStateRef).catch(() => getDoc(dailyStateRef)),
         getActiveSalesReps().catch(() => []),
-        getDocs(collection(db, 'batches')).catch(() => null),
-        getDocs(
+        getDocsFromServer(collection(db, 'batches')).catch(() =>
+          getDocs(collection(db, 'batches'))
+        ),
+        getDocsFromServer(
           query(collection(db, 'leads'), where('status', '==', 'FRESH'))
-        ).catch(() => null),
+        ).catch(() =>
+          getDocs(query(collection(db, 'leads'), where('status', '==', 'FRESH')))
+        ),
       ]);
 
     const activeRepCount = Math.max(1, activeReps.length || 3);
@@ -645,24 +638,9 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
         batchMap.set(b.batchId, b);
       }
     });
-    if (batchMap.size === 0) {
-      for (const lb of loadLocalBatches()) {
-        if (lb && lb.batchId && !isLegacyMockBatch(lb)) {
-          batchMap.set(lb.batchId, lb);
-        }
-      }
-    }
     const existingBatches = Array.from(batchMap.values());
 
     const freshLeadMap = new Map<string, LeadRecord>();
-    for (const ll of loadLocalLeads()) {
-      if (
-        (ll.status === 'FRESH' || ll.status === 'REVIVED_FRESH') &&
-        !isLegacyMockOrSyntheticLead(ll)
-      ) {
-        freshLeadMap.set(ll.id, ll);
-      }
-    }
     freshLeadsSnap?.forEach((d) => {
       const l = { id: d.id, ...(d.data() as Omit<LeadRecord, 'id'>) };
       if (!isLegacyMockOrSyntheticLead(l)) {
@@ -681,7 +659,6 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
     );
 
     if (!partitioned.changed && !isNewIstDay) {
-      saveLocalBatches(partitioned.todayBatches);
       return {
         batches: partitioned.todayBatches,
         todayBatches: partitioned.todayBatches,
@@ -698,9 +675,7 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
       lastResetAt: nowIso,
     };
     saveLocalDailyStateMeta(processingState);
-    await setDoc(dailyStateRef, processingState, { merge: true }).catch(
-      () => undefined
-    );
+    await setDoc(dailyStateRef, processingState, { merge: true });
 
     // 1. Delete all prior-date and extra/duplicate/closed batch documents from `batches`
     for (let i = 0; i < partitioned.deletedBatchIds.length; i += 400) {
@@ -755,11 +730,7 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
       lastResetAt: nowIso,
     };
     saveLocalDailyStateMeta(completedState);
-    await setDoc(dailyStateRef, completedState, { merge: true }).catch(
-      () => undefined
-    );
-
-    saveLocalBatches(partitioned.todayBatches);
+    await setDoc(dailyStateRef, completedState, { merge: true });
 
     return {
       batches: partitioned.todayBatches,
@@ -768,7 +739,8 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
       activeRepCount,
       changed: true,
     };
-  } catch {
+  } catch (err) {
+    reportCloudSyncError(err, 'Daily Batch Reset & Partition Engine');
     return null;
   }
 }

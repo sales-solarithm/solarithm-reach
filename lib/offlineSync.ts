@@ -75,119 +75,18 @@ export interface OfflineSyncFlushReport {
   flushedAt: string;
 }
 
-// In-memory store for Node.js test environments where neither IndexedDB nor localStorage exists
+// Pure in-memory queue (IndexedDB & localStorage disabled to prevent browser-isolated ghost data)
 let memoryLocalQueue: LeadRecord[] = [];
 let memoryPendingDispositions: PendingDispositionItem[] = [];
 
-function hasIndexedDB(): boolean {
-  return typeof globalThis !== 'undefined' && typeof globalThis.indexedDB !== 'undefined';
-}
-
-function hasLocalStorage(): boolean {
-  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
-}
-
-function openOfflineDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    if (!hasIndexedDB()) {
-      reject(new Error('IndexedDB not available'));
-      return;
-    }
-    const request = globalThis.indexedDB.open(OFFLINE_DB_NAME, OFFLINE_DB_VERSION);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(REACH_LOCAL_QUEUE_STORE)) {
-        db.createObjectStore(REACH_LOCAL_QUEUE_STORE, { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains(PENDING_DISPOSITIONS_STORE)) {
-        const store = db.createObjectStore(PENDING_DISPOSITIONS_STORE, { keyPath: 'id' });
-        store.createIndex('clientLoggedAt', 'clientLoggedAt', { unique: false });
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB'));
-  });
-}
-
-/**
- * 1.1 Store active batch leads in a persistent client-side cache (`reach_local_queue`).
- */
 export async function cacheActiveBatchLeads(leads: LeadRecord[]): Promise<void> {
   memoryLocalQueue = [...leads];
-  if (hasLocalStorage()) {
-    try {
-      window.localStorage.setItem(FALLBACK_QUEUE_STORAGE_KEY, JSON.stringify(leads));
-    } catch {
-      // Ignore quota errors
-    }
-  }
-  if (!hasIndexedDB()) return;
-
-  try {
-    const db = await openOfflineDatabase();
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(REACH_LOCAL_QUEUE_STORE, 'readwrite');
-      const store = tx.objectStore(REACH_LOCAL_QUEUE_STORE);
-      store.clear();
-      for (const lead of leads) {
-        store.put(lead);
-      }
-      tx.oncomplete = () => {
-        db.close();
-        resolve();
-      };
-      tx.onerror = () => {
-        db.close();
-        reject(tx.error);
-      };
-    });
-  } catch {
-    // Fallback already saved to memory/localStorage
-  }
 }
 
-/**
- * Reads cached active batch leads from `reach_local_queue`.
- */
 export async function getCachedBatchLeads(): Promise<LeadRecord[]> {
-  if (hasIndexedDB()) {
-    try {
-      const db = await openOfflineDatabase();
-      const items = await new Promise<LeadRecord[]>((resolve, reject) => {
-        const tx = db.transaction(REACH_LOCAL_QUEUE_STORE, 'readonly');
-        const store = tx.objectStore(REACH_LOCAL_QUEUE_STORE);
-        const req = store.getAll();
-        req.onsuccess = () => {
-          db.close();
-          resolve((req.result as LeadRecord[]) || []);
-        };
-        req.onerror = () => {
-          db.close();
-          reject(req.error);
-        };
-      });
-      if (items.length > 0) return items;
-    } catch {
-      // Fall through
-    }
-  }
-
-  if (hasLocalStorage()) {
-    try {
-      const raw = window.localStorage.getItem(FALLBACK_QUEUE_STORAGE_KEY);
-      if (raw) return JSON.parse(raw) as LeadRecord[];
-    } catch {
-      // Fall through
-    }
-  }
-
   return [...memoryLocalQueue];
 }
 
-/**
- * 1.2 Enqueues a call disposition in `pending_dispositions` with exact local timestamp:
- * `clientLoggedAt = new Date().toISOString()`.
- */
 export async function enqueueOfflineDisposition(
   input: OfflineDispositionInput
 ): Promise<PendingDispositionItem> {
@@ -213,138 +112,21 @@ export async function enqueueOfflineDisposition(
 
   memoryPendingDispositions.push(item);
   memoryPendingDispositions.sort((a, b) => a.clientLoggedAt.localeCompare(b.clientLoggedAt));
-
-  if (hasLocalStorage()) {
-    try {
-      window.localStorage.setItem(
-        FALLBACK_PENDING_STORAGE_KEY,
-        JSON.stringify(memoryPendingDispositions)
-      );
-    } catch {
-      // Ignore storage error
-    }
-  }
-
-  if (hasIndexedDB()) {
-    try {
-      const db = await openOfflineDatabase();
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(PENDING_DISPOSITIONS_STORE, 'readwrite');
-        const store = tx.objectStore(PENDING_DISPOSITIONS_STORE);
-        store.put(item);
-        tx.oncomplete = () => {
-          db.close();
-          resolve();
-        };
-        tx.onerror = () => {
-          db.close();
-          reject(tx.error);
-        };
-      });
-    } catch {
-      // Fallback already persisted
-    }
-  }
-
   return item;
 }
 
-/**
- * Returns all queued items from `pending_dispositions` ordered by `clientLoggedAt` ascending.
- */
 export async function getPendingDispositions(): Promise<PendingDispositionItem[]> {
-  if (hasIndexedDB()) {
-    try {
-      const db = await openOfflineDatabase();
-      const items = await new Promise<PendingDispositionItem[]>((resolve, reject) => {
-        const tx = db.transaction(PENDING_DISPOSITIONS_STORE, 'readonly');
-        const store = tx.objectStore(PENDING_DISPOSITIONS_STORE);
-        const req = store.getAll();
-        req.onsuccess = () => {
-          db.close();
-          resolve((req.result as PendingDispositionItem[]) || []);
-        };
-        req.onerror = () => {
-          db.close();
-          reject(req.error);
-        };
-      });
-      if (items.length > 0 || memoryPendingDispositions.length === 0) {
-        items.sort((a, b) => a.clientLoggedAt.localeCompare(b.clientLoggedAt));
-        memoryPendingDispositions = items;
-        return items;
-      }
-    } catch {
-      // Fall through
-    }
-  }
-
-  if (hasLocalStorage()) {
-    try {
-      const raw = window.localStorage.getItem(FALLBACK_PENDING_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as PendingDispositionItem[];
-        parsed.sort((a, b) => a.clientLoggedAt.localeCompare(b.clientLoggedAt));
-        memoryPendingDispositions = parsed;
-        return parsed;
-      }
-    } catch {
-      // Fall through
-    }
-  }
-
   return [...memoryPendingDispositions].sort((a, b) =>
     a.clientLoggedAt.localeCompare(b.clientLoggedAt)
   );
 }
 
-/**
- * Clears all or specified disposition IDs from `pending_dispositions`.
- */
 export async function clearPendingDispositions(idsToRemove?: string[]): Promise<void> {
   if (!idsToRemove) {
     memoryPendingDispositions = [];
   } else {
     const idSet = new Set(idsToRemove);
     memoryPendingDispositions = memoryPendingDispositions.filter((i) => !idSet.has(i.id));
-  }
-
-  if (hasLocalStorage()) {
-    try {
-      window.localStorage.setItem(
-        FALLBACK_PENDING_STORAGE_KEY,
-        JSON.stringify(memoryPendingDispositions)
-      );
-    } catch {
-      // Ignore
-    }
-  }
-
-  if (hasIndexedDB()) {
-    try {
-      const db = await openOfflineDatabase();
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(PENDING_DISPOSITIONS_STORE, 'readwrite');
-        const store = tx.objectStore(PENDING_DISPOSITIONS_STORE);
-        if (!idsToRemove) {
-          store.clear();
-        } else {
-          for (const id of idsToRemove) {
-            store.delete(id);
-          }
-        }
-        tx.oncomplete = () => {
-          db.close();
-          resolve();
-        };
-        tx.onerror = () => {
-          db.close();
-          reject(tx.error);
-        };
-      });
-    } catch {
-      // Ignore
-    }
   }
 }
 

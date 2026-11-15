@@ -3,6 +3,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  getDocsFromServer,
   query,
   setDoc,
   where,
@@ -11,6 +12,7 @@ import {
 import {
   hasLiveReachFirebaseConfig,
   reachDb as db,
+  reportCloudSyncError,
 } from './firebaseDual';
 import {
   AuthorizedUser,
@@ -172,90 +174,85 @@ export function stripSystemIngestionNotePure(notes?: string | null): string {
   return trimmed;
 }
 
-export function loadLocalLeads(): LeadRecord[] {
-  if (typeof window === 'undefined') return [];
+function purgeDeprecatedBrowserStorageKeys(): void {
+  if (typeof window === 'undefined') return;
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEYS.LEADS);
-    if (!raw) {
-      window.localStorage.setItem(STORAGE_KEYS.CLEAN_RESET_MARKER, '1');
-      return [];
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      window.localStorage.setItem(STORAGE_KEYS.LEADS, '[]');
-      window.localStorage.setItem(STORAGE_KEYS.CLEAN_RESET_MARKER, '1');
-      return [];
-    }
-    const cleaned = (parsed as LeadRecord[])
-      .filter((l) => !isLegacyMockOrSyntheticLead(l))
-      .map((l) => {
-        const sanitizedNotes = stripSystemIngestionNotePure(l.notes);
-        return sanitizedNotes !== l.notes ? { ...l, notes: sanitizedNotes } : l;
-      });
-    if (
-      cleaned.length !== parsed.length ||
-      !window.localStorage.getItem(STORAGE_KEYS.CLEAN_RESET_MARKER)
-    ) {
-      window.localStorage.setItem(STORAGE_KEYS.LEADS, JSON.stringify(cleaned));
-      window.localStorage.setItem(STORAGE_KEYS.CLEAN_RESET_MARKER, '1');
-    }
-    return cleaned;
+    window.localStorage.removeItem(STORAGE_KEYS.LEADS);
+    window.localStorage.removeItem(STORAGE_KEYS.BATCHES);
+    window.localStorage.removeItem(STORAGE_KEYS.USERS);
+    window.localStorage.removeItem(STORAGE_KEYS.CLEAN_RESET_MARKER);
   } catch {
-    return [];
+    // Ignore
   }
 }
 
-export function saveLocalLeads(leads: LeadRecord[]): void {
-  if (typeof window === 'undefined') return;
-  try {
-    const cleaned = leads
-      .filter((l) => !isLegacyMockOrSyntheticLead(l))
-      .map((l) => {
-        const sanitizedNotes = stripSystemIngestionNotePure(l.notes);
-        return sanitizedNotes !== l.notes ? { ...l, notes: sanitizedNotes } : l;
-      });
-    if (cleaned.length === 0) {
-      window.localStorage.removeItem(STORAGE_KEYS.LEADS);
-      return;
-    }
-    window.localStorage.setItem(STORAGE_KEYS.LEADS, JSON.stringify(cleaned));
-  } catch {
-    // Ignore storage quota errors for massive datasets in restricted browsers
-  }
+export function loadLocalLeads(): LeadRecord[] {
+  purgeDeprecatedBrowserStorageKeys();
+  return [];
+}
+
+export function saveLocalLeads(_leads: LeadRecord[]): void {
+  purgeDeprecatedBrowserStorageKeys();
 }
 
 export function loadLocalBatches(): BatchRecord[] {
-  if (typeof window === 'undefined') return [];
+  purgeDeprecatedBrowserStorageKeys();
+  return [];
+}
+
+export function saveLocalBatches(_batches: BatchRecord[]): void {
+  purgeDeprecatedBrowserStorageKeys();
+}
+
+/**
+ * Fetches all leads directly from the live Cloud Firestore server (`getDocsFromServer`)
+ * so Browser 1 and Browser 2 always see the exact same server-acknowledged lead database.
+ */
+export async function fetchAllLeadsFromServerFirestore(): Promise<LeadRecord[]> {
+  if (!hasLiveReachFirebaseConfig()) return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEYS.BATCHES);
-    if (!raw) {
-      return [];
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    const cleaned = (parsed as BatchRecord[]).filter(
-      (b) =>
-        b &&
-        typeof b.batchId === 'string' &&
-        typeof b.batchNumber === 'number' &&
-        !isLegacyMockBatch(b)
+    const snap = await getDocsFromServer(collection(db, 'leads')).catch(() =>
+      getDocs(collection(db, 'leads'))
     );
-    if (cleaned.length !== parsed.length) {
-      window.localStorage.setItem(STORAGE_KEYS.BATCHES, JSON.stringify(cleaned));
-    }
-    return cleaned;
-  } catch {
+    const list: LeadRecord[] = [];
+    snap.forEach((d) => {
+      const record = { id: d.id, ...(d.data() as Omit<LeadRecord, 'id'>) };
+      if (!isLegacyMockOrSyntheticLead(record)) {
+        const sanitizedNotes = stripSystemIngestionNotePure(record.notes);
+        list.push(
+          sanitizedNotes !== record.notes
+            ? { ...record, notes: sanitizedNotes }
+            : record
+        );
+      }
+    });
+    return list;
+  } catch (err) {
+    reportCloudSyncError(err, 'Fetch Leads from Cloud DB');
     return [];
   }
 }
 
-export function saveLocalBatches(batches: BatchRecord[]): void {
-  if (typeof window === 'undefined') return;
+/**
+ * Fetches all batches directly from the live Cloud Firestore server (`getDocsFromServer`).
+ */
+export async function fetchAllBatchesFromServerFirestore(): Promise<BatchRecord[]> {
+  if (!hasLiveReachFirebaseConfig()) return [];
   try {
-    const cleaned = batches.filter((b) => !isLegacyMockBatch(b));
-    window.localStorage.setItem(STORAGE_KEYS.BATCHES, JSON.stringify(cleaned));
-  } catch {
-    // Ignore quota errors
+    const snap = await getDocsFromServer(collection(db, 'batches')).catch(() =>
+      getDocs(collection(db, 'batches'))
+    );
+    const list: BatchRecord[] = [];
+    snap.forEach((d) => {
+      const record = d.data() as BatchRecord;
+      if (record && record.batchId && !isLegacyMockBatch(record)) {
+        list.push(record);
+      }
+    });
+    return list.sort((a, b) => a.batchNumber - b.batchNumber);
+  } catch (err) {
+    reportCloudSyncError(err, 'Fetch Batches from Cloud DB');
+    return [];
   }
 }
 
@@ -340,35 +337,12 @@ export async function purgeLegacySeededMockLeadsFromFirestore(
 }
 
 export function loadAuthorizedUsers(): AuthorizedUser[] {
-  if (typeof window === 'undefined') return INITIAL_AUTHORIZED_USERS;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEYS.USERS);
-    if (!raw) {
-      window.localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(INITIAL_AUTHORIZED_USERS));
-      return INITIAL_AUTHORIZED_USERS;
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) return INITIAL_AUTHORIZED_USERS;
-    const mergedMap = new Map<string, AuthorizedUser>();
-    for (const u of parsed as AuthorizedUser[]) {
-      if (u?.email) mergedMap.set(u.email.toLowerCase(), u);
-    }
-    for (const seedUser of INITIAL_AUTHORIZED_USERS) {
-      mergedMap.set(seedUser.email.toLowerCase(), seedUser);
-    }
-    return Array.from(mergedMap.values());
-  } catch {
-    return INITIAL_AUTHORIZED_USERS;
-  }
+  purgeDeprecatedBrowserStorageKeys();
+  return INITIAL_AUTHORIZED_USERS;
 }
 
-export function saveAuthorizedUsers(users: AuthorizedUser[]): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
-  } catch {
-    // Ignore storage errors
-  }
+export function saveAuthorizedUsers(_users: AuthorizedUser[]): void {
+  purgeDeprecatedBrowserStorageKeys();
 }
 
 /**
@@ -1299,14 +1273,15 @@ export async function runPreFlightIngestionCheck(
 }
 
 /**
- * Attempts to persist created/updated leads to Firestore in batched chunks of 400,
- * sanitizing payloads via `sanitizeFirestorePayload` before committing.
+ * Persists created/updated leads to Firestore (`reachDb`) in batched chunks of 400,
+ * sanitizing payloads via `sanitizeFirestorePayload` and awaiting real server acknowledgment.
+ * Surfaces any permission-denied or network error via `reportCloudSyncError`.
  */
 export async function syncLeadsToFirestore(leadsToSync: LeadRecord[]): Promise<void> {
   const hasConfiguredProject = hasLiveReachFirebaseConfig();
   if (!hasConfiguredProject || leadsToSync.length === 0) return;
 
-  const chunks = chunkArray(leadsToSync, 450);
+  const chunks = chunkArray(leadsToSync, 400);
   for (const chunk of chunks) {
     try {
       const batch = writeBatch(db);
@@ -1314,13 +1289,10 @@ export async function syncLeadsToFirestore(leadsToSync: LeadRecord[]): Promise<v
         const sanitizedLead = sanitizeFirestorePayload(lead);
         batch.set(doc(db, 'leads', lead.id), sanitizedLead, { merge: true });
       }
-      await Promise.race([
-        batch.commit().catch(() => {}),
-        new Promise<void>((resolve) => setTimeout(resolve, 2500)),
-      ]);
-    } catch {
-      // Non-blocking if remote Firestore rules restrict direct client batch writes
-      break;
+      await batch.commit();
+    } catch (err) {
+      reportCloudSyncError(err, 'syncLeadsToFirestore');
+      throw err;
     }
   }
 }

@@ -21,7 +21,10 @@ import {
   enrichSanitizedRowWithHistoricalFieldsPure,
 } from '@/lib/historicalImportParser';
 import { sanitizeFirestorePayload } from '@/lib/firestoreSanitizer';
-import { hasLiveReachFirebaseConfig } from '@/lib/firebaseDual';
+import {
+  hasLiveReachFirebaseConfig,
+  reportCloudSyncError,
+} from '@/lib/firebaseDual';
 
 export const EXCEL_STREAM_CHUNK_SIZE = 500;
 export const MAX_FIRESTORE_BATCH_OPS = 500;
@@ -332,13 +335,32 @@ export async function commitIngestionIn500OpBatches(
         const cleanLead = sanitizeFirestorePayload(lead);
         wb.set(doc(db, 'leads', lead.id), cleanLead, { merge: true });
       }
-      const timeoutMs = hasLiveReachFirebaseConfig() ? 350 : 40;
-      await Promise.race([
-        wb.commit().catch(() => {}),
-        new Promise((resolve) => setTimeout(resolve, timeoutMs)),
-      ]);
-    } catch {
-      // Local state still commits per 500-op chunk in preview environment
+      if (typeof window !== 'undefined' && hasLiveReachFirebaseConfig()) {
+        await wb.commit();
+      } else {
+        await Promise.race([
+          wb.commit().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 40)),
+        ]);
+      }
+    } catch (err) {
+      const cloudErr = reportCloudSyncError(
+        err,
+        `Excel Upload Batch Commit (Chunk #${idx + 1})`
+      );
+      if (typeof window !== 'undefined') {
+        const unprocessedRecords = chunks.slice(idx).flat();
+        return {
+          importBatchId,
+          totalRequestedRecords: recordsToCommit.length,
+          committedRecordsCount,
+          committedChunksCount,
+          failedAtChunkIndex: idx,
+          unprocessedRecords,
+          errorReason: cloudErr.formattedBanner,
+          timestamp: new Date().toISOString(),
+        };
+      }
     }
 
     committedRecordsCount += chunk.length;

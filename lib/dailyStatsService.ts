@@ -5,13 +5,18 @@ import {
   doc,
   getCountFromServer,
   getDocs,
+  getDocsFromServer,
   limit,
   query,
   startAfter,
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { hasLiveReachFirebaseConfig, reachDb } from './firebaseDual';
+import {
+  hasLiveReachFirebaseConfig,
+  reachDb,
+  reportCloudSyncError,
+} from './firebaseDual';
 import { CANONICAL_NEXUS_EMPLOYEES } from './authService';
 import { OwnerMetricStripData } from './dashboardMetrics';
 import { sanitizeFirestorePayload } from './firestoreSanitizer';
@@ -261,44 +266,40 @@ export function mergeDailyStatsRecordsPure(
 }
 
 export function loadLocalDailyStats(): DailyRepStatRecord[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = window.localStorage.getItem(DAILY_STATS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as DailyRepStatRecord[]) : [];
-  } catch {
-    return [];
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(DAILY_STATS_STORAGE_KEY);
+    } catch {
+      // Ignore
+    }
   }
+  return [];
 }
 
-export function saveLocalDailyStats(stats: DailyRepStatRecord[]): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(DAILY_STATS_STORAGE_KEY, JSON.stringify(stats));
-  } catch {
-    // Ignore storage quota errors
+export function saveLocalDailyStats(_stats: DailyRepStatRecord[]): void {
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(DAILY_STATS_STORAGE_KEY);
+    } catch {
+      // Ignore
+    }
   }
 }
 
 /**
- * Syncs `daily_stats/{YYYY-MM-DD}_{repEmail}` summary documents to `reachDb` in 500-op chunks.
+ * Syncs `daily_stats/{YYYY-MM-DD}_{repEmail}` summary documents to `reachDb` in 400-op chunks.
  */
 export async function syncDailyStatsToFirestore(
   leads: LeadRecord[]
 ): Promise<DailyRepStatRecord[]> {
   const computed = computeDailyStatsFromLeadsPure(leads);
-  const existingLocal = loadLocalDailyStats();
-  const merged = mergeDailyStatsRecordsPure(existingLocal, computed);
-  saveLocalDailyStats(merged);
-
-  if (!hasLiveReachFirebaseConfig() || merged.length === 0) {
-    return merged;
+  if (!hasLiveReachFirebaseConfig() || computed.length === 0) {
+    return computed;
   }
 
   try {
-    for (let i = 0; i < merged.length; i += 450) {
-      const chunk = merged.slice(i, i + 450);
+    for (let i = 0; i < computed.length; i += 400) {
+      const chunk = computed.slice(i, i + 400);
       const wb = writeBatch(reachDb);
       for (const stat of chunk) {
         wb.set(
@@ -309,35 +310,33 @@ export async function syncDailyStatsToFirestore(
       }
       await wb.commit();
     }
-  } catch {
-    // Non-blocking fallback
+  } catch (err) {
+    reportCloudSyncError(err, 'syncDailyStatsToFirestore');
   }
 
-  return merged;
+  return computed;
 }
 
 /**
- * Fetches all lightweight `daily_stats` documents from `reachDb`.
+ * Fetches all lightweight `daily_stats` documents directly from `reachDb` server.
  */
 export async function fetchDailyStatsFromFirestore(): Promise<DailyRepStatRecord[]> {
   if (!hasLiveReachFirebaseConfig()) {
-    return loadLocalDailyStats();
+    return [];
   }
   try {
-    const snap = await getDocs(collection(reachDb, 'daily_stats'));
+    const snap = await getDocsFromServer(collection(reachDb, 'daily_stats')).catch(
+      () => getDocs(collection(reachDb, 'daily_stats'))
+    );
     const list: DailyRepStatRecord[] = [];
     snap.forEach((d) => {
       list.push(d.data() as DailyRepStatRecord);
     });
-    if (list.length > 0) {
-      const merged = mergeDailyStatsRecordsPure(loadLocalDailyStats(), list);
-      saveLocalDailyStats(merged);
-      return merged;
-    }
-  } catch {
-    // Fallback to local cache
+    return list;
+  } catch (err) {
+    reportCloudSyncError(err, 'fetchDailyStatsFromFirestore');
+    return [];
   }
-  return loadLocalDailyStats();
 }
 
 let isAggregationQuerySupported =

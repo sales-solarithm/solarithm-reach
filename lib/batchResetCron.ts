@@ -3,7 +3,11 @@ import {
   setDoc,
   writeBatch,
 } from 'firebase/firestore';
-import { hasLiveReachFirebaseConfig, reachDb as db } from './firebaseDual';
+import {
+  hasLiveReachFirebaseConfig,
+  reachDb as db,
+  reportCloudSyncError,
+} from './firebaseDual';
 import { AuthorizedUser, LeadRecord } from './types';
 import {
   DailyBatchDocument,
@@ -324,12 +328,10 @@ export async function persistDailyBatchToFirestore(
   if (!hasLiveReachFirebaseConfig()) return;
   try {
     const sanitized = sanitizeFirestorePayload(batch);
-    await Promise.race([
-      setDoc(doc(db, 'batches', batch.batchId), sanitized, { merge: true }).catch(() => {}),
-      new Promise<void>((resolve) => setTimeout(resolve, 1000)),
-    ]);
-  } catch {
-    // Non-blocking fallback in preview environment
+    await setDoc(doc(db, 'batches', batch.batchId), sanitized, { merge: true });
+  } catch (err) {
+    reportCloudSyncError(err, 'persistDailyBatchToFirestore');
+    throw err;
   }
 }
 
@@ -347,12 +349,10 @@ export async function persistDailyBatchesToFirestore(
         merge: true,
       });
     }
-    await Promise.race([
-      wb.commit().catch(() => {}),
-      new Promise<void>((resolve) => setTimeout(resolve, 1500)),
-    ]);
-  } catch {
-    // Non-blocking fallback
+    await wb.commit();
+  } catch (err) {
+    reportCloudSyncError(err, 'persistDailyBatchesToFirestore');
+    throw err;
   }
 }
 
@@ -488,12 +488,10 @@ export async function executeFirestoreBatchClaim(
 
   try {
     const batchRef = doc(db, 'batches', batchId);
-    await Promise.race([
-      setDoc(batchRef, payload, { merge: true }).catch(() => {}),
-      new Promise<void>((resolve) => setTimeout(resolve, 1500)),
-    ]);
-  } catch {
-    // Non-blocking fallback when running against restricted preview rules
+    await setDoc(batchRef, payload, { merge: true });
+  } catch (err) {
+    reportCloudSyncError(err, 'executeFirestoreBatchClaim');
+    throw err;
   }
 }
 
@@ -710,12 +708,10 @@ export async function executeFirestoreBatchRelease(
 
   try {
     const batchRef = doc(db, 'batches', batchId);
-    await Promise.race([
-      setDoc(batchRef, payload, { merge: true }).catch(() => {}),
-      new Promise<void>((resolve) => setTimeout(resolve, 1500)),
-    ]);
-  } catch {
-    // Non-blocking fallback
+    await setDoc(batchRef, payload, { merge: true });
+  } catch (err) {
+    reportCloudSyncError(err, 'executeFirestoreBatchRelease');
+    throw err;
   }
 }
 

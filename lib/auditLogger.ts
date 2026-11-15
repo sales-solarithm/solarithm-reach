@@ -41,28 +41,21 @@ export function buildAuditLogRecord(eventData: CreateAuditLogInput): AuditLogRec
   };
 }
 
+let memoryAuditLogs: AuditLogRecord[] = [...INITIAL_AUDIT_LOGS];
+
 export function loadLocalAuditLogs(): AuditLogRecord[] {
-  if (typeof window === 'undefined') return INITIAL_AUDIT_LOGS;
-  try {
-    const raw = localStorage.getItem(LOCAL_AUDIT_LOGS_KEY);
-    if (!raw) {
-      localStorage.setItem(LOCAL_AUDIT_LOGS_KEY, JSON.stringify(INITIAL_AUDIT_LOGS));
-      return INITIAL_AUDIT_LOGS;
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(LOCAL_AUDIT_LOGS_KEY);
+    } catch {
+      // Ignore
     }
-    const parsed = JSON.parse(raw) as AuditLogRecord[];
-    return Array.isArray(parsed) && parsed.length > 0 ? parsed : INITIAL_AUDIT_LOGS;
-  } catch {
-    return INITIAL_AUDIT_LOGS;
   }
+  return [...memoryAuditLogs];
 }
 
 export function saveLocalAuditLogs(logs: AuditLogRecord[]): void {
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(LOCAL_AUDIT_LOGS_KEY, JSON.stringify(logs));
-  } catch {
-    // Ignore quota errors
-  }
+  memoryAuditLogs = [...logs];
 }
 
 export function appendLocalAuditLogs(newRecords: AuditLogRecord[]): AuditLogRecord[] {

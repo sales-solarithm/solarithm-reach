@@ -109,48 +109,21 @@ export function computeRepTodayCallsFromLeads(
   return baseCount + sessionCallsToday;
 }
 
+let memoryTeamTargets: TeamTargetsConfig = { ...DEFAULT_TEAM_TARGETS };
+
 export function loadLocalTeamTargets(): TeamTargetsConfig {
-  if (typeof window === 'undefined') return DEFAULT_TEAM_TARGETS;
-  try {
-    const raw = window.localStorage.getItem(LOCAL_TARGETS_STORAGE_KEY);
-    if (!raw) return DEFAULT_TEAM_TARGETS;
-    const parsed = JSON.parse(raw) as Partial<TeamTargetsConfig>;
-    return {
-      dailyDialsTarget:
-        typeof parsed.dailyDialsTarget === 'number' && parsed.dailyDialsTarget > 0
-          ? parsed.dailyDialsTarget
-          : DEFAULT_TEAM_TARGETS.dailyDialsTarget,
-      weeklyInterestedTarget:
-        typeof parsed.weeklyInterestedTarget === 'number' &&
-        parsed.weeklyInterestedTarget > 0
-          ? parsed.weeklyInterestedTarget
-          : DEFAULT_TEAM_TARGETS.weeklyInterestedTarget,
-      proposalTurnaroundTargetHours:
-        typeof parsed.proposalTurnaroundTargetHours === 'number' &&
-        parsed.proposalTurnaroundTargetHours > 0
-          ? parsed.proposalTurnaroundTargetHours
-          : DEFAULT_TEAM_TARGETS.proposalTurnaroundTargetHours,
-      updatedAt: parsed.updatedAt,
-      updatedByEmail: parsed.updatedByEmail,
-    };
-  } catch {
-    return DEFAULT_TEAM_TARGETS;
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(LOCAL_TARGETS_STORAGE_KEY);
+    } catch {
+      // Ignore
+    }
   }
+  return { ...memoryTeamTargets };
 }
 
 export function saveLocalTeamTargets(config: TeamTargetsConfig): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(LOCAL_TARGETS_STORAGE_KEY, JSON.stringify(config));
-    window.dispatchEvent(
-      new StorageEvent('storage', {
-        key: LOCAL_TARGETS_STORAGE_KEY,
-        newValue: JSON.stringify(config),
-      })
-    );
-  } catch {
-    // Ignore storage quota errors
-  }
+  memoryTeamTargets = { ...config };
 }
 
 export async function saveTeamTargetsToFirestore(
@@ -271,15 +244,8 @@ export function RepDailyProgressBar({
       // Ignore
     }
 
-    const handleStorage = (e: StorageEvent) => {
-      if (e.key === LOCAL_TARGETS_STORAGE_KEY) {
-        setLiveTargets(loadLocalTeamTargets());
-      }
-    };
-    window.addEventListener('storage', handleStorage);
     return () => {
       unsub?.();
-      window.removeEventListener('storage', handleStorage);
     };
   }, [targets]);
 

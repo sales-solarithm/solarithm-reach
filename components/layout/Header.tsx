@@ -20,6 +20,10 @@ import {
   TeamTargetsConfig,
   computeRepTodayCallsFromLeads,
 } from '@/components/settings/TargetSettings';
+import {
+  REACH_FIREBASE_CONFIG,
+  verifyReachCloudConnectionFromServer,
+} from '@/lib/firebaseDual';
 
 export interface HeaderProps {
   leads?: LeadRecord[];
@@ -71,10 +75,23 @@ export function Header({
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [cloudDbConnected, setCloudDbConnected] = useState<boolean>(true);
   const profileDropdownRef = useRef<HTMLDivElement | null>(null);
+  const cloudProjectId = String(
+    REACH_FIREBASE_CONFIG.projectId || 'solarithm-tools-370ed'
+  );
 
   useEffect(() => {
     setMounted(true);
+    let active = true;
+    void verifyReachCloudConnectionFromServer().then((res) => {
+      if (active) {
+        setCloudDbConnected(res.connected);
+      }
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -139,6 +156,22 @@ export function Header({
               </span>
               <span className="hidden lg:inline-block text-xs font-medium text-slate-500 dark:text-slate-400 truncate">
                 Enterprise Outreach
+              </span>
+              <span
+                data-testid="cloud-db-status-badge"
+                title={`Live Cloud Firestore Project: ${cloudProjectId}`}
+                className={`hidden sm:inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[11px] font-mono whitespace-nowrap ${
+                  cloudDbConnected
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-400'
+                    : 'bg-red-500/10 border-red-500/30 text-red-600 dark:text-red-400'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    cloudDbConnected ? 'bg-emerald-500' : 'bg-red-500'
+                  }`}
+                />
+                <span>Cloud DB: {cloudProjectId}</span>
               </span>
             </div>
           </div>

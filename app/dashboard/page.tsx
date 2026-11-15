@@ -1,16 +1,22 @@
 'use client';
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Search, CheckCircle2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Search, X } from 'lucide-react';
 import {
   collection,
   getDocs,
+  getDocsFromServer,
   limit,
   onSnapshot,
   query,
   where,
 } from 'firebase/firestore';
-import { reachDb as db } from '@/lib/firebaseDual';
+import {
+  CloudSyncErrorEvent,
+  clearCloudSyncError,
+  reachDb as db,
+  subscribeToCloudSyncErrors,
+} from '@/lib/firebaseDual';
 import { useAuth } from '@/context/AuthContext';
 import { LoginModal } from '@/components/auth/LoginModal';
 import { Header } from '@/components/layout/Header';
@@ -34,14 +40,12 @@ import {
 import {
   WorkspaceFilterTab,
   applyManualCompanyNameEditPure,
+  fetchAllBatchesFromServerFirestore,
+  fetchAllLeadsFromServerFirestore,
   filterAndSortWorkspaceTableLeadsPure,
   isLegacyMockBatch,
   isLegacyMockOrSyntheticLead,
-  loadLocalBatches,
-  loadLocalLeads,
   purgeLegacySeededMockLeadsFromFirestore,
-  saveLocalBatches,
-  saveLocalLeads,
   syncLeadsToFirestore,
 } from '@/lib/leadStore';
 import {
@@ -75,8 +79,6 @@ import {
   areRepEmailsEquivalentPure,
   fetchDailyStatsFromFirestore,
   fetchOwnerMetricCountsFromServer,
-  loadLocalDailyStats,
-  saveLocalDailyStats,
   syncDailyStatsToFirestore,
 } from '@/lib/dailyStatsService';
 import {
@@ -148,6 +150,8 @@ export default function DashboardPage() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isExcelModalOpen, setIsExcelModalOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [cloudSyncError, setCloudSyncError] =
+    useState<CloudSyncErrorEvent | null>(null);
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -156,27 +160,60 @@ export default function DashboardPage() {
     }, 3500);
   }, []);
 
-  // Load initial state, server-side status counts (getCountFromServer), automatic new-day sweep & batch division, and bounded leads query
   useEffect(() => {
-    setLeads(loadLocalLeads());
-    setBatches(loadLocalBatches());
-    setDailyStats(loadLocalDailyStats());
+    return subscribeToCloudSyncErrors((errEvent) => {
+      setCloudSyncError(errEvent);
+    });
+  }, []);
+
+  // Load initial state directly from live Cloud Firestore server (`getDocsFromServer`),
+  // run automatic new-day sweep & batch division, and attach real-time listeners for batches & daily_stats
+  useEffect(() => {
+    let isMounted = true;
     setTeamTargets(loadLocalTeamTargets());
-    void fetchTeamTargetsFromFirestore().then((t) => setTeamTargets(t));
+    void fetchTeamTargetsFromFirestore().then((t) => {
+      if (isMounted) setTeamTargets(t);
+    });
     void purgeLegacySeededMockLeadsFromFirestore();
-    void fetchDailyStatsFromFirestore().then((st) => setDailyStats(st));
+    void fetchDailyStatsFromFirestore().then((st) => {
+      if (isMounted) setDailyStats(st);
+    });
     void fetchOwnerMetricCountsFromServer().then((counts) => {
-      if (counts) {
+      if (isMounted && counts) {
         setServerOwnerMetrics(counts);
       }
     });
     void getActiveSalesReps()
       .then((reps) => {
-        if (Array.isArray(reps) && reps.length > 0) {
+        if (isMounted && Array.isArray(reps) && reps.length > 0) {
           setActiveSalesRepCount(reps.length);
         }
       })
       .catch(() => {});
+
+    // Fetch all leads and batches directly from the live Cloud Firestore server (`reachDb`)
+    // so Browser 1 and Browser 2 immediately synchronize from the exact same cloud database
+    void Promise.all([
+      fetchAllLeadsFromServerFirestore(),
+      fetchAllBatchesFromServerFirestore(),
+    ]).then(([serverLeads, serverBatches]) => {
+      if (!isMounted) return;
+      if (serverBatches.length > 0) {
+        setBatches(serverBatches);
+      }
+      if (serverLeads.length > 0) {
+        setLeads((prev) => {
+          const map = new Map<string, LeadRecord>();
+          for (const l of prev) {
+            if (!isLegacyMockOrSyntheticLead(l)) map.set(l.id, l);
+          }
+          for (const sl of serverLeads) {
+            if (!isLegacyMockOrSyntheticLead(sl)) map.set(sl.id, sl);
+          }
+          return Array.from(map.values());
+        });
+      }
+    });
 
     // Automatically sweep stale prior-day batches/uncalled FRESH leads and generate today's equal batches on mount
     const todayIst = getTodayIstDateString();
@@ -184,7 +221,7 @@ export default function DashboardPage() {
       todayIst,
       new Date()
     ).then((res) => {
-      if (!res) return;
+      if (!isMounted || !res) return;
       if (res.activeRepCount > 0) {
         setActiveSalesRepCount(res.activeRepCount);
       }
@@ -192,7 +229,6 @@ export default function DashboardPage() {
         .filter((b) => !isLegacyMockBatch(b))
         .sort((a, b) => a.batchNumber - b.batchNumber);
       setBatches(cleanTodayBatches);
-      saveLocalBatches(cleanTodayBatches);
 
       if (res.freshLeads.length > 0) {
         setLeads((prev) => {
@@ -203,19 +239,13 @@ export default function DashboardPage() {
           for (const fl of res.freshLeads) {
             if (!isLegacyMockOrSyntheticLead(fl)) map.set(fl.id, fl);
           }
-          const merged = Array.from(map.values());
-          saveLocalLeads(merged);
-          return merged;
+          return Array.from(map.values());
         });
       }
       void fetchOwnerMetricCountsFromServer().then((counts) => {
-        if (counts) setServerOwnerMetrics(counts);
+        if (isMounted && counts) setServerOwnerMetrics(counts);
       });
     });
-
-    // Do NOT attach an unbounded onSnapshot(collection(db, 'leads')) listener!
-    // Unbounded listeners download all 4,740+ leads on every write and cause post-upload UI lag.
-    // Instead, active tab/batch leads are fetched via bounded limit(50) queries below.
 
     let unsubDailyStats: (() => void) | undefined;
     try {
@@ -225,7 +255,6 @@ export default function DashboardPage() {
           if (snap.empty) return;
           const remoteStats = snap.docs.map((d) => d.data() as DailyRepStatRecord);
           setDailyStats(remoteStats);
-          saveLocalDailyStats(remoteStats);
         },
         () => {}
       );
@@ -243,46 +272,28 @@ export default function DashboardPage() {
             .filter((b) => !isLegacyMockBatch(b))
             .sort((a, b) => a.batchNumber - b.batchNumber);
           setBatches(remoteBatches);
-          saveLocalBatches(remoteBatches);
         },
-        () => {
-          // Graceful fallback in preview rules
-        }
+        () => {}
       );
     } catch {
       // Ignore offline error
     }
 
-    const handleStorage = (e: StorageEvent) => {
-      if (e.key === 'solarithm_reach_batches_v1') {
-        setBatches(loadLocalBatches());
-      } else if (e.key === 'solarithm_reach_leads_v1') {
-        setLeads(loadLocalLeads());
-      } else if (e.key === 'solarithm_reach_daily_stats_v1') {
-        setDailyStats(loadLocalDailyStats());
-      } else if (e.key === 'solarithm_reach_team_targets_v1') {
-        setTeamTargets(loadLocalTeamTargets());
-      }
-    };
-    window.addEventListener('storage', handleStorage);
-
     return () => {
+      isMounted = false;
       unsubDailyStats?.();
       unsubBatches?.();
-      window.removeEventListener('storage', handleStorage);
     };
   }, []);
 
   const updateLeadsState = useCallback((nextLeads: LeadRecord[]) => {
     const cleaned = nextLeads.filter((l) => !isLegacyMockOrSyntheticLead(l));
     setLeads(cleaned);
-    saveLocalLeads(cleaned);
   }, []);
 
   const updateBatchesState = useCallback((nextBatches: BatchRecord[]) => {
     const cleaned = nextBatches.filter((b) => !isLegacyMockBatch(b));
     setBatches(cleaned);
-    saveLocalBatches(cleaned);
   }, []);
 
   const handleSyncBatchesFromFirestore = useCallback(
@@ -291,7 +302,6 @@ export default function DashboardPage() {
         .filter((b) => !isLegacyMockBatch(b))
         .sort((a, b) => a.batchNumber - b.batchNumber);
       setBatches(cleaned);
-      saveLocalBatches(cleaned);
     },
     []
   );
@@ -504,9 +514,6 @@ export default function DashboardPage() {
     });
     setActiveBatchIdFilter(null);
     setSelectedLead(null);
-    saveLocalLeads([]);
-    saveLocalBatches([]);
-    saveLocalDailyStats([]);
     void fetchOwnerMetricCountsFromServer().then((counts) => {
       if (counts) setServerOwnerMetrics(counts);
     });
@@ -707,32 +714,37 @@ export default function DashboardPage() {
         : `Imported ${newLeads.length} fresh leads and updated ${updatedLeads.length} existing leads`
     );
 
-    // Defer background Firestore syncs to next tick so modal close & table render are 100% instant
-    setTimeout(() => {
-      if (partitioned.newBatches.length > 0) {
-        void persistDailyBatchesToFirestore(partitioned.newBatches);
-      }
+    // Commit partitioned batches and all imported/partitioned leads directly to Cloud Firestore (`reachDb`)
+    void (async () => {
+      try {
+        if (partitioned.todayBatches.length > 0) {
+          await persistDailyBatchesToFirestore(partitioned.todayBatches);
+        }
 
-      const newBatchIds = new Set(partitioned.newBatches.map((nb) => nb.batchId));
-      const partitionedChangedLeads = partitioned.updatedLeads.filter(
-        (l) => l.assignedBatchId && newBatchIds.has(l.assignedBatchId)
-      );
+        const importedIdSet = new Set(allImported.map((l) => l.id));
+        const activeTodayBatchIds = new Set(
+          partitioned.todayBatches.map((nb) => nb.batchId)
+        );
+        const leadsToSyncToCloud = partitioned.updatedLeads.filter(
+          (l) =>
+            importedIdSet.has(l.id) ||
+            (l.assignedBatchId && activeTodayBatchIds.has(l.assignedBatchId))
+        );
 
-      if (partitionedChangedLeads.length > 0) {
-        void syncLeadsToFirestore(partitionedChangedLeads).then(() => {
-          void fetchOwnerMetricCountsFromServer().then((counts) => {
-            if (counts) setServerOwnerMetrics(counts);
-          });
-        });
-      } else {
-        void fetchOwnerMetricCountsFromServer().then((counts) => {
-          if (counts) setServerOwnerMetrics(counts);
-        });
+        if (leadsToSyncToCloud.length > 0) {
+          await syncLeadsToFirestore(leadsToSyncToCloud);
+        }
+
+        const [counts, st] = await Promise.all([
+          fetchOwnerMetricCountsFromServer(),
+          syncDailyStatsToFirestore(partitioned.updatedLeads),
+        ]);
+        if (counts) setServerOwnerMetrics(counts);
+        setDailyStats(st);
+      } catch {
+        // Error already surfaced via reportCloudSyncError banner
       }
-      void syncDailyStatsToFirestore(partitioned.updatedLeads).then((st) =>
-        setDailyStats(st)
-      );
-    }, 0);
+    })();
   };
 
   const ownerMetrics = useMemo(() => {
@@ -812,7 +824,6 @@ export default function DashboardPage() {
             .filter((b) => !isLegacyMockBatch(b))
             .sort((a, b) => a.batchNumber - b.batchNumber);
           setBatches(cleanToday);
-          saveLocalBatches(cleanToday);
           if (res.freshLeads.length > 0) {
             setLeads((prev) => {
               const map = new Map<string, LeadRecord>();
@@ -822,9 +833,7 @@ export default function DashboardPage() {
               for (const fl of res.freshLeads) {
                 if (!isLegacyMockOrSyntheticLead(fl)) map.set(fl.id, fl);
               }
-              const merged = Array.from(map.values());
-              saveLocalLeads(merged);
-              return merged;
+              return Array.from(map.values());
             });
           }
           void fetchOwnerMetricCountsFromServer().then((counts) => {
@@ -875,7 +884,7 @@ export default function DashboardPage() {
   const repClaimedBatchId = workspaceFilterResult.repClaimedTodayBatch?.batchId || null;
   const firstTodayBatchId = todayActiveBatches[0]?.batchId || null;
 
-  // Bounded 50-Row Single-Field Firestore Query for Active Tab / Active Batch
+  // Bounded 50-Row Single-Field Server Firestore Query for Active Tab / Active Batch
   useEffect(() => {
     let isMounted = true;
     const runBoundedQuery = async () => {
@@ -888,16 +897,12 @@ export default function DashboardPage() {
             : repClaimedBatchId;
           if (!targetBatchId) return;
 
-          const snap = await Promise.race([
-            getDocs(
-              query(
-                collection(db, 'leads'),
-                where('assignedBatchId', '==', targetBatchId),
-                limit(50)
-              )
-            ),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 900)),
-          ]);
+          const q = query(
+            collection(db, 'leads'),
+            where('assignedBatchId', '==', targetBatchId),
+            limit(50)
+          );
+          const snap = await getDocsFromServer(q).catch(() => getDocs(q));
           if (!isMounted || !snap || snap.empty) return;
           const fetched: LeadRecord[] = [];
           snap.forEach((d) => {
@@ -919,16 +924,12 @@ export default function DashboardPage() {
             });
           }
         } else {
-          const snap = await Promise.race([
-            getDocs(
-              query(
-                collection(db, 'leads'),
-                where('status', '==', statusFilter),
-                limit(50)
-              )
-            ),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 900)),
-          ]);
+          const q = query(
+            collection(db, 'leads'),
+            where('status', '==', statusFilter),
+            limit(50)
+          );
+          const snap = await getDocsFromServer(q).catch(() => getDocs(q));
           if (!isMounted || !snap || snap.empty) return;
           const fetched: LeadRecord[] = [];
           snap.forEach((d) => {
@@ -1062,6 +1063,34 @@ export default function DashboardPage() {
       )}
 
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-3 sm:px-6 py-4 sm:py-5 space-y-4 sm:space-y-5">
+        {cloudSyncError && (
+          <div
+            role="alert"
+            data-testid="cloud-sync-error-banner"
+            className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/40 text-red-700 dark:text-red-300 text-xs font-mono flex items-start justify-between gap-3"
+          >
+            <div className="flex items-start gap-2.5 min-w-0">
+              <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+              <div className="space-y-0.5 min-w-0 break-words">
+                <div className="font-bold">
+                  Cloud Sync Error on project {cloudSyncError.projectId}:{' '}
+                  {cloudSyncError.errorCode} — Check Firestore Rules
+                </div>
+                <div className="text-[11px] opacity-90">
+                  Operation: {cloudSyncError.operation} · {cloudSyncError.errorMessage}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => clearCloudSyncError()}
+              aria-label="Dismiss Cloud Sync Error"
+              className="p-1 rounded hover:bg-red-500/20 text-red-500 shrink-0 cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
         {activeWorkspaceView === 'ANALYTICS' ? (
           isOwner ? (
             <OwnerAnalyticsView
