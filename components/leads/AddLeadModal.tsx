@@ -26,6 +26,7 @@ import {
   computeOperationalDatesForStatus,
 } from '@/lib/leadStore';
 import { sanitizeFirestorePayload } from '@/lib/firestoreSanitizer';
+import { formatRepName } from '@/lib/utils';
 
 interface AddLeadModalProps {
   isOpen: boolean;
@@ -312,6 +313,7 @@ export function AddLeadModal({
       assignedBatchId: null,
       assignedRepEmail: isAddedBySalesRep ? creatorEmail : null,
       assignedRepName: isAddedBySalesRep ? creatorName : null,
+      source: 'manual',
       createdByEmail: creatorEmail,
       createdByName: creatorName,
       createdByRole: creatorRole,
@@ -353,10 +355,9 @@ export function AddLeadModal({
   };
 
   const existingCollisionLead = activeDuplicateMatch?.lead || null;
-  const assignedRepLabel =
-    existingCollisionLead?.assignedRepName?.split(' (')[0].trim() ||
-    existingCollisionLead?.assignedRepEmail ||
-    'Unassigned / Global Pool';
+  const assignedRepLabel = existingCollisionLead?.assignedRepName
+    ? formatRepName(existingCollisionLead.assignedRepName)
+    : existingCollisionLead?.assignedRepEmail || 'Unassigned / Global Pool';
   const lastCalledLabel = existingCollisionLead?.lastCalledDate
     ? existingCollisionLead.lastCalledDate.slice(0, 10)
     : 'Never';

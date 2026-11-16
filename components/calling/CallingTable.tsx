@@ -15,6 +15,7 @@ import {
   stripSystemIngestionNotePure,
 } from '@/lib/leadStore';
 import { Drawer } from '@/components/shared/Drawer';
+import { formatRepName } from '@/lib/utils';
 
 export interface CallingTableProps {
   leads: LeadRecord[];
@@ -56,6 +57,41 @@ export function formatCityState(lead: LeadRecord): string {
 export function formatLastCalledDate(lastCalledDate: string | null): string {
   if (!lastCalledDate) return 'Never';
   return lastCalledDate.slice(0, 10);
+}
+
+export function formatLastCalledByRepNamePure(lead: LeadRecord): string {
+  const raw = lead.lastCalledByName || lead.assignedRepName || '';
+  return formatRepName(raw);
+}
+
+export function formatRetryCooldownSummaryPure(lead: LeadRecord): {
+  attempts: number;
+  didntReceiveCount: number;
+  switchOffCount: number;
+  hasRetries: boolean;
+  summaryText: string;
+} {
+  const attempts = Number(lead.callAttempts || 0);
+  const didntReceiveCount = Number(lead.didntReceiveCount || 0);
+  const switchOffCount = Number(lead.switchOffCount || 0);
+  const hasRetries = didntReceiveCount > 0 || switchOffCount > 0;
+  const parts: string[] = [];
+  if (didntReceiveCount > 0) {
+    parts.push(`Didn't Receive: ${didntReceiveCount}`);
+  }
+  if (switchOffCount > 0) {
+    parts.push(`Switch Off: ${switchOffCount}`);
+  }
+  return {
+    attempts,
+    didntReceiveCount,
+    switchOffCount,
+    hasRetries,
+    summaryText:
+      parts.length > 0
+        ? parts.join(' · ')
+        : 'Didn\'t Receive: 0 · Switch Off: 0',
+  };
 }
 
 export function getStatusPillClasses(status: LeadStatus): string {
@@ -135,11 +171,9 @@ export function buildLeadNotesActivityHistoryPure(
       const cleaned = stripSystemIngestionNotePure(entry.note);
       if (!cleaned) continue;
       seenTexts.add(cleaned);
-      const repDisplay = String(
+      const repDisplay = formatRepName(
         entry.repName || entry.repEmail || lead.lastCalledByName || lead.assignedRepName || 'Sales Rep'
-      )
-        .split(' (')[0]
-        .trim();
+      );
       const rawTs = String(entry.timestamp || '');
       const formattedTs = rawTs.includes('T')
         ? rawTs.slice(0, 16).replace('T', ' ')
@@ -156,11 +190,9 @@ export function buildLeadNotesActivityHistoryPure(
 
   const legacyNotes = stripSystemIngestionNotePure(lead.notes);
   if (legacyNotes && items.length === 0) {
-    const fallbackRep = String(
+    const fallbackRep = formatRepName(
       lead.lastCalledByName || lead.assignedRepName || 'Sales Rep'
-    )
-      .split(' (')[0]
-      .trim();
+    );
     const fallbackTs = String(
       lead.lastCalledDate || lead.updatedAt || lead.createdAt || ''
     ).slice(0, 10);
@@ -273,6 +305,8 @@ export function CallingTable({
                 <th className="px-3.5 py-2">Company Name</th>
                 <th className="px-3.5 py-2">Phone Number</th>
                 <th className="px-3.5 py-2">City, State</th>
+                <th className="px-3.5 py-2">Attempts &amp; Retries</th>
+                <th className="px-3.5 py-2">Last Called By</th>
                 <th className="px-3.5 py-2">Last Called</th>
                 <th className="px-3.5 py-2">Status</th>
                 <th className="px-3.5 py-2 text-right">Action</th>
@@ -282,7 +316,7 @@ export function CallingTable({
               {pageLeads.length === 0 ? (
                 <tr className="h-[48px]">
                   <td
-                    colSpan={6}
+                    colSpan={8}
                     data-testid="calling-table-empty-state"
                     className="px-4 py-7 text-center text-xs text-slate-500 dark:text-slate-400"
                   >
@@ -298,8 +332,10 @@ export function CallingTable({
                     ? formatOwnerSubStatusBadgePure(lead.ownerSubStatus)
                     : null;
                   const originatingRepShort = lead.assignedRepName
-                    ? lead.assignedRepName.split(' (')[0].trim()
+                    ? formatRepName(lead.assignedRepName)
                     : null;
+                  const retryInfo = formatRetryCooldownSummaryPure(lead);
+                  const lastCalledByLabel = formatLastCalledByRepNamePure(lead);
 
                   return (
                     <tr
@@ -313,7 +349,7 @@ export function CallingTable({
                       }`}
                     >
                       {/* 1. Company Name (Bold, clean text) */}
-                      <td className="px-3.5 py-1.5 font-semibold text-slate-900 dark:text-white max-w-[300px]">
+                      <td className="px-3.5 py-1.5 font-semibold text-slate-900 dark:text-white max-w-[280px]">
                         <div className="truncate">{lead.companyName}</div>
                         {coEscalatedPill && (
                           <span
@@ -346,12 +382,44 @@ export function CallingTable({
                         {formatCityState(lead)}
                       </td>
 
-                      {/* 4. Last Called (Date or "Never") */}
+                      {/* 4. Attempts & Retries (Total Call Attempts + Didn't Receive / Switch Off cycle count) */}
+                      <td
+                        data-testid={`attempts-retries-cell-${lead.id}`}
+                        className="px-3.5 py-1.5 font-mono text-[11px] whitespace-nowrap"
+                      >
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/[0.05] text-slate-700 dark:text-slate-300 tabular-nums">
+                            Attempts: {retryInfo.attempts}
+                          </span>
+                          {(retryInfo.hasRetries || isOwner) && (
+                            <span
+                              data-testid={`retry-cooldown-badge-${lead.id}`}
+                              className={`px-1.5 py-0.5 rounded border text-[10px] tabular-nums ${
+                                retryInfo.hasRetries
+                                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-700 dark:text-amber-300 font-semibold'
+                                  : 'bg-slate-50 dark:bg-white/[0.03] border-slate-200 dark:border-white/10 text-slate-500 dark:text-slate-400'
+                              }`}
+                            >
+                              {retryInfo.summaryText}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+
+                      {/* 5. Last Called By (Rep Name) */}
+                      <td
+                        data-testid={`last-called-by-cell-${lead.id}`}
+                        className="px-3.5 py-1.5 font-mono text-[11px] text-slate-600 dark:text-slate-300 whitespace-nowrap"
+                      >
+                        {lastCalledByLabel}
+                      </td>
+
+                      {/* 6. Last Called (Date or "Never") */}
                       <td className="px-3.5 py-1.5 font-mono text-[11px] text-slate-500 dark:text-slate-400 whitespace-nowrap">
                         {formatLastCalledDate(lead.lastCalledDate)}
                       </td>
 
-                      {/* 5. Status (Minimal colored text pill + Owner Closing Sub-Status & Rep Attribution on INTERESTED) */}
+                      {/* 7. Status (Minimal colored text pill + Owner Closing Sub-Status & Rep Attribution on INTERESTED) */}
                       <td className="px-3.5 py-1.5 whitespace-nowrap">
                         {isInterestedLead && ownerSubBadge ? (
                           <div className="flex flex-wrap items-center gap-1.5">
@@ -387,7 +455,7 @@ export function CallingTable({
                         )}
                       </td>
 
-                      {/* 6. Action (Simple button: [Call / Update] or Read-Only Handover badge) */}
+                      {/* 8. Action (Simple button: [Call / Update] or Read-Only Handover badge) */}
                       <td className="px-3.5 py-1.5 text-right whitespace-nowrap">
                         {isReadOnlyHandover ? (
                           <span
@@ -438,8 +506,10 @@ export function CallingTable({
                 ? formatOwnerSubStatusBadgePure(lead.ownerSubStatus)
                 : null;
               const originatingRepShort = lead.assignedRepName
-                ? lead.assignedRepName.split(' (')[0].trim()
+                ? formatRepName(lead.assignedRepName)
                 : null;
+              const retryInfo = formatRetryCooldownSummaryPure(lead);
+              const lastCalledByLabel = formatLastCalledByRepNamePure(lead);
 
               return (
                 <div
@@ -477,6 +547,21 @@ export function CallingTable({
                       >
                         {lead.status}
                       </span>
+                    )}
+                  </div>
+
+                  {/* Attempts, Retries, and Last Called By Metadata */}
+                  <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/[0.05] text-slate-700 dark:text-slate-300">
+                      Attempts: {retryInfo.attempts}
+                    </span>
+                    {(retryInfo.hasRetries || isOwner) && (
+                      <span className="px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/25 text-amber-700 dark:text-amber-300">
+                        {retryInfo.summaryText}
+                      </span>
+                    )}
+                    {lastCalledByLabel !== '—' && (
+                      <span>· Caller: {lastCalledByLabel}</span>
                     )}
                   </div>
 
@@ -695,6 +780,24 @@ export function CallingTable({
                       {formatCityState(selectedLead)}
                     </span>
                   </div>
+                  {/* Call Attempts & Retry / Cooldown Cycle Strip inside Drawer */}
+                  <div
+                    data-testid="drawer-attempt-retry-strip"
+                    className="flex flex-wrap items-center gap-1.5 mt-2 text-[11px] font-mono"
+                  >
+                    <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-white/[0.05] text-slate-700 dark:text-slate-200 tabular-nums">
+                      Total Attempts: {selectedLead.callAttempts || 0}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/25 text-amber-700 dark:text-amber-300 tabular-nums">
+                      Didn&apos;t Receive: {selectedLead.didntReceiveCount || 0} · Switch Off:{' '}
+                      {selectedLead.switchOffCount || 0}
+                    </span>
+                    {formatLastCalledByRepNamePure(selectedLead) !== '—' && (
+                      <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-white/[0.05] text-slate-600 dark:text-slate-300">
+                        Last Caller: {formatLastCalledByRepNamePure(selectedLead)}
+                      </span>
+                    )}
+                  </div>
                   {formatCoEscalatedPillText(selectedLead) && (
                     <div className="mt-2">
                       <span
@@ -725,7 +828,7 @@ export function CallingTable({
                 >
                   <div className="flex items-center gap-1.5 font-semibold text-emerald-700 dark:text-emerald-300">
                     <Flame className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                    <span>Hot Client Handover Note ({selectedLead.escalatedByName || 'Sales Rep'})</span>
+                    <span>Hot Client Handover Note ({formatRepName(selectedLead.escalatedByName || 'Sales Rep')})</span>
                   </div>
                   <p className="text-slate-700 dark:text-slate-200 leading-relaxed">
                     {selectedLead.hotEscalationNote}
@@ -750,7 +853,7 @@ export function CallingTable({
                     ) : (
                       selectedLead.assignedRepName && (
                         <span className="font-mono text-slate-500 dark:text-slate-400 truncate max-w-[180px]">
-                          Rep: {selectedLead.assignedRepName.split(' (')[0]}
+                          Rep: {formatRepName(selectedLead.assignedRepName)}
                         </span>
                       )
                     )}
@@ -877,7 +980,7 @@ export function CallingTable({
                       Didn&apos;t Receive (48h Cooldown Retry · Max 10 attempts)
                     </option>
                     <option value="SWITCH_OFF">
-                      Switch Off (Retry Pool · Max 3 attempts)
+                      Switch Off (48h Cooldown Retry · Max 3 attempts)
                     </option>
                     <option value="NOT_INTERESTED">
                       Not Interested (Moves to Dead / Closed Out)

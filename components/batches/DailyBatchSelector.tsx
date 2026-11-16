@@ -24,6 +24,7 @@ import {
 } from '@/lib/employeeQueries';
 import { CANONICAL_NEXUS_EMPLOYEES } from '@/lib/authService';
 import { areRepEmailsEquivalentPure } from '@/lib/dailyStatsService';
+import { formatRepName } from '@/lib/utils';
 
 interface DailyBatchSelectorProps {
   currentUser: AuthorizedUser;
@@ -394,7 +395,7 @@ export function DailyBatchSelector({
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-300">
               Batch ID: <span className="font-mono">{myActiveClaimedBatch.batchId}</span> · Locked by{' '}
-              <strong>{myActiveClaimedBatch.claimedByName?.split(' (')[0]}</strong> · Completed Calls:{' '}
+              <strong>{formatRepName(myActiveClaimedBatch.claimedByName)}</strong> · Completed Calls:{' '}
               <strong className="font-mono tabular-nums">
                 {myActiveBatchDialedCount.toLocaleString()}
               </strong>{' '}
@@ -437,7 +438,7 @@ export function DailyBatchSelector({
               const totalLeadsCount = batch.totalLeads ?? batch.leadIds?.length ?? 0;
               const remainingFreshCount = getBatchRemainingFreshLeadsCount(batch);
               const claimedRepShortName = batch.claimedByName
-                ? batch.claimedByName.split(' (')[0].trim()
+                ? formatRepName(batch.claimedByName)
                 : 'Rep';
 
               return (
@@ -537,7 +538,7 @@ export function DailyBatchSelector({
                                     rep.name
                                   )
                               );
-                              const shortRepName = rep.name.split(' (')[0];
+                              const shortRepName = formatRepName(rep.name);
                               return (
                                 <option
                                   key={rep.email}
@@ -590,7 +591,7 @@ export function DailyBatchSelector({
                         <span className="text-slate-500 dark:text-slate-400">Rep: </span>
                         <strong className="text-slate-900 dark:text-white truncate">
                           {batch.claimedByName
-                            ? batch.claimedByName.split(' (')[0]
+                            ? formatRepName(batch.claimedByName)
                             : 'Unclaimed'}
                         </strong>
                         <span className="ml-2 font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">

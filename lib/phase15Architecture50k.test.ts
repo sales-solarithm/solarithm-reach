@@ -12,7 +12,12 @@ import {
   computeOwnerAnalyticsPure,
   computeSalesRepAnalyticsPure,
 } from './performanceAnalytics';
-import { paginateCallingLeadsPure, CALLING_TABLE_PAGE_SIZE } from '../components/calling/CallingTable';
+import {
+  paginateCallingLeadsPure,
+  CALLING_TABLE_PAGE_SIZE,
+  formatLastCalledByRepNamePure,
+} from '../components/calling/CallingTable';
+import { formatRepName } from './utils';
 import { computeDailyStatsFromLeadsPure, resolveCanonicalRepIdentity } from './dailyStatsService';
 import {
   applyClaimOrUpdateExistingLeadPure,
@@ -37,6 +42,8 @@ import {
   computeOwnerMetricStripPure,
   computeSalesRepMetricStripPure,
 } from './dashboardMetrics';
+import { getTodayIstDateString } from '../types/batch';
+import { CANONICAL_NEXUS_EMPLOYEES } from './authService';
 import { BatchRecord, LeadRecord, SanitizedRowItem } from './types';
 
 function makeFreshLead(idx: number): LeadRecord {
@@ -1481,9 +1488,19 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
     });
     assert.equal(nextDayFollowUpLead1.callAttempts, 1);
 
-    // 4. Verify Module 5.2 Scorecard NEW LEADS Metric increments whenever a sales rep engages a lead whose prior status was FRESH
+    // 4. Verify Performance Chart & Scorecard strictly separate Manual Lead Additions (+ Add Lead) from Daily Dials
+    const manualLeadAddedByHasti: LeadRecord = {
+      ...nextDayFollowUpLead1,
+      id: 'manual-lead-hasti-1',
+      source: 'manual',
+      importBatchId: null,
+      createdByEmail: 'hastisavani.07@solarithmdesign.com',
+      createdByName: 'Savani Hasti Vijaybhai',
+      createdByRole: 'SALES',
+      createdAt: '2026-11-16T07:00:00.000Z',
+    };
     const ownerScorecardReport = computeOwnerAnalyticsPure(
-      [nextDayFollowUpLead1, ownerUpdatedLead2],
+      [nextDayFollowUpLead1, ownerUpdatedLead2, manualLeadAddedByHasti],
       [
         {
           employeeId: 'SOL-HS-001',
@@ -1503,9 +1520,383 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
       (r) => r.repEmail === 'hastisavani.07@solarithmdesign.com'
     );
     assert.ok(hastiScorecard);
-    assert.equal(hastiScorecard.callsDialed, 2);
-    assert.equal(hastiScorecard.newLeadsAdded, 2); // Both Lead #1 and Lead #2 were engaged from FRESH by Hasti
-    assert.equal(hastiScorecard.proposalsShared, 1);
+    assert.equal(hastiScorecard.callsDialed, 3);
+    assert.equal(hastiScorecard.newLeadsAdded, 1); // Strictly 1 manual lead created via + Add Lead
+    assert.equal(hastiScorecard.proposalsShared, 2);
     assert.equal(hastiScorecard.interestedGenerated, 1);
+  });
+
+  it('27. Comprehensive Production Fixes: Counter Drift Reconciliation, Clickable Metric Filters, 🔥 To-Call Today Priority Queue, Owner Master Lead Table, and 48h Cooldown for DIDNT_RECEIVE & SWITCH_OFF', () => {
+    const todayDate = getTodayIstDateString();
+    const pastFollowUpDate = '2026-01-10T09:00:00.000Z';
+    const futureFollowUpDate = '2099-12-31T09:00:00.000Z';
+    const expiredCooldownIso = new Date(Date.now() - 3600 * 1000).toISOString();
+    const activeCooldownIso = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+
+    const repEmail = 'hastisavani.07@solarithmdesign.com';
+    const repName = 'Savani Hasti Vijaybhai';
+
+    const batchToday: BatchRecord = {
+      batchId: `BATCH-${todayDate}-1`,
+      date: todayDate,
+      batchNumber: 1,
+      status: 'IN_PROGRESS',
+      claimedByEmail: repEmail,
+      claimedByName: repName,
+      claimedAt: `${todayDate}T04:00:00.000Z`,
+      totalLeads: 5,
+      totalLeadsAssigned: 5,
+      completedCallsCount: 4, // Suppose batch counter has 4 completed calls
+      remainingLeads: 1,
+      leadIds: [
+        'lead-fresh-1',
+        'lead-prop-due',
+        'lead-future-due',
+        'lead-dr-expired',
+        'lead-dead-1',
+      ],
+    };
+
+    const sampleLeads: LeadRecord[] = [
+      {
+        ...makeFreshLead(1),
+        id: 'lead-fresh-1',
+        status: 'FRESH',
+        assignedBatchId: batchToday.batchId,
+        assignedRepEmail: repEmail,
+        assignedRepName: repName,
+        callAttempts: 0,
+      },
+      {
+        ...makeFreshLead(2),
+        id: 'lead-prop-due',
+        status: 'PROPOSAL_SHARED',
+        assignedBatchId: batchToday.batchId,
+        assignedRepEmail: repEmail,
+        assignedRepName: repName,
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+        lastCalledDate: `${todayDate}T05:00:00.000Z`,
+        nextFollowUpDate: pastFollowUpDate,
+        callAttempts: 2,
+      },
+      {
+        ...makeFreshLead(3),
+        id: 'lead-future-due',
+        status: 'FUTURE_REQUIREMENT',
+        assignedBatchId: batchToday.batchId,
+        assignedRepEmail: repEmail,
+        assignedRepName: repName,
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+        lastCalledDate: `${todayDate}T05:10:00.000Z`,
+        nextFollowUpDate: pastFollowUpDate,
+        callAttempts: 1,
+      },
+      {
+        ...makeFreshLead(4),
+        id: 'lead-dr-expired',
+        status: 'DIDNT_RECEIVE',
+        assignedBatchId: batchToday.batchId,
+        assignedRepEmail: repEmail,
+        assignedRepName: repName,
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+        lastCalledDate: '2026-01-01T10:00:00.000Z',
+        cooldownUntil: expiredCooldownIso,
+        didntReceiveCount: 2,
+        callAttempts: 2,
+      },
+      {
+        ...makeFreshLead(5),
+        id: 'lead-so-active-cooldown',
+        status: 'SWITCH_OFF',
+        assignedBatchId: null,
+        assignedRepEmail: repEmail,
+        assignedRepName: repName,
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+        lastCalledDate: `${todayDate}T05:20:00.000Z`,
+        cooldownUntil: activeCooldownIso,
+        switchOffCount: 1,
+        callAttempts: 1,
+      },
+      {
+        ...makeFreshLead(6),
+        id: 'lead-dead-1',
+        status: 'NOT_INTERESTED',
+        assignedBatchId: batchToday.batchId,
+        assignedRepEmail: repEmail,
+        assignedRepName: repName,
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+        lastCalledDate: `${todayDate}T05:30:00.000Z`,
+        callAttempts: 1,
+      },
+      {
+        ...makeFreshLead(7),
+        id: 'lead-prop-not-due',
+        status: 'PROPOSAL_SHARED',
+        assignedBatchId: null,
+        assignedRepEmail: repEmail,
+        assignedRepName: repName,
+        nextFollowUpDate: futureFollowUpDate,
+        callAttempts: 1,
+      },
+    ];
+
+    // 1. Counter Drift Reconciliation: Owner callsDialedToday reconciles with today's batch completedCallsCount
+    const ownerMetrics = computeOwnerMetricStripPure(
+      sampleLeads,
+      CANONICAL_NEXUS_EMPLOYEES,
+      [batchToday]
+    );
+    assert.equal(ownerMetrics.callsDialedToday, 4);
+    assert.equal(ownerMetrics.deadClosedOut, 1);
+
+    // 2. Clickable Metric Inspectors: CALLS_DIALED_TODAY & DEAD_CLOSED_OUT filter the workspace table
+    const dialedTodayRes = filterAndSortWorkspaceTableLeadsPure({
+      leads: sampleLeads,
+      batches: [batchToday],
+      tab: 'CALLS_DIALED_TODAY',
+      isOwner: true,
+      userEmail: 'jay@solarithm.com',
+      todayDate,
+    });
+    assert.equal(dialedTodayRes.filteredLeads.length, 4);
+
+    const deadClosedRes = filterAndSortWorkspaceTableLeadsPure({
+      leads: sampleLeads,
+      batches: [batchToday],
+      tab: 'DEAD_CLOSED_OUT',
+      isOwner: true,
+      userEmail: 'jay@solarithm.com',
+      todayDate,
+    });
+    assert.equal(deadClosedRes.filteredLeads.length, 1);
+    assert.equal(deadClosedRes.filteredLeads[0].id, 'lead-dead-1');
+
+    // 3. Dedicated Rep Priority Tab: 🔥 To-Call Today (TO_CALL_TODAY)
+    // Includes PROPOSAL_SHARED due, FUTURE_REQUIREMENT due, and DIDNT_RECEIVE with expired 48h cooldown
+    // Excludes SWITCH_OFF still inside active 48h cooldown and PROPOSAL_SHARED not yet due
+    const toCallTodayRepRes = filterAndSortWorkspaceTableLeadsPure({
+      leads: sampleLeads,
+      batches: [batchToday],
+      tab: 'TO_CALL_TODAY',
+      isOwner: false,
+      userEmail: repEmail,
+      todayDate,
+    });
+    const toCallIds = toCallTodayRepRes.filteredLeads.map((l) => l.id);
+    assert.ok(toCallIds.includes('lead-prop-due'));
+    assert.ok(toCallIds.includes('lead-future-due'));
+    assert.ok(toCallIds.includes('lead-dr-expired'));
+    assert.ok(!toCallIds.includes('lead-so-active-cooldown'));
+    assert.ok(!toCallIds.includes('lead-prop-not-due'));
+
+    // 4. Comprehensive Owner Master Lead Table (ALL_LEADS): shows all leads in batch with latest status & attempt history
+    const ownerAllBatchLeadsRes = filterAndSortWorkspaceTableLeadsPure({
+      leads: sampleLeads,
+      batches: [batchToday],
+      tab: 'ALL_LEADS',
+      isOwner: true,
+      userEmail: 'jay@solarithm.com',
+      todayDate,
+      selectedBatchIdFilter: batchToday.batchId,
+    });
+    assert.equal(ownerAllBatchLeadsRes.filteredLeads.length, 5);
+
+    // 5. Strict 48-Hour Cooldown Rule Enforcement on SWITCH_OFF disposition
+    const freshForSwitchOff: LeadRecord = {
+      ...makeFreshLead(99),
+      id: 'lead-switch-off-test',
+      status: 'FRESH',
+    };
+    const afterSwitchOff = applyCallDispositionUpdatePure(freshForSwitchOff, {
+      newStatus: 'SWITCH_OFF',
+      callDate: '2026-11-16',
+      notes: 'Phone switched off',
+      actorUser: {
+        email: repEmail,
+        name: repName,
+        role: 'SALES',
+      },
+      nowIso: '2026-11-16T10:00:00.000Z',
+    });
+    assert.equal(afterSwitchOff.status, 'SWITCH_OFF');
+    assert.equal(afterSwitchOff.switchOffCount, 1);
+    assert.equal(afterSwitchOff.callAttempts, 1);
+    assert.ok(
+      afterSwitchOff.cooldownUntil &&
+        afterSwitchOff.cooldownUntil > '2026-11-17T00:00:00.000Z',
+      'SWITCH_OFF must set a mandatory 48-hour cooldownUntil timestamp'
+    );
+  });
+
+  it('28. Daily Reset Pool Release & Tail-End Batch Sequencing: retains current-day DIDNT_RECEIVE/SWITCH_OFF in Calls Dialed Today, releases cooled-down retries on daily reset, and places 1,688 untouched leads first (1..1688) and 11 retry leads strictly at the tail end (1689..1699)', () => {
+    const todayDate = '2026-11-16';
+    const resetNow = new Date('2026-11-16T00:05:00.000Z');
+    const repEmail = 'hastisavani.07@solarithmdesign.com';
+    const repName = 'Savani Hasti Vijaybhai';
+
+    // 1,688 untouched fresh leads (Priority 1)
+    const untouchedLeads: LeadRecord[] = Array.from({ length: 1688 }, (_, idx) => ({
+      ...makeFreshLead(idx + 1),
+      id: `untouched-${idx + 1}`,
+      status: 'FRESH',
+      callAttempts: 0,
+      didntReceiveCount: 0,
+      switchOffCount: 0,
+    }));
+
+    // 11 prior-day cooled-down retry leads (7 DIDNT_RECEIVE + 4 SWITCH_OFF) whose >=48h cooldown has expired (Priority 2)
+    const cooledDownRetryLeads: LeadRecord[] = Array.from({ length: 11 }, (_, idx) => {
+      const isSwitchOff = idx >= 7;
+      return {
+        ...makeFreshLead(2000 + idx),
+        id: `retry-cooled-${idx + 1}`,
+        status: isSwitchOff ? 'SWITCH_OFF' : 'DIDNT_RECEIVE',
+        callAttempts: 1,
+        didntReceiveCount: isSwitchOff ? 0 : 1,
+        switchOffCount: isSwitchOff ? 1 : 0,
+        lastCalledDate: '2026-11-13T09:00:00.000Z', // > 48h ago
+        cooldownUntil: '2026-11-15T09:00:00.000Z', // expired before 2026-11-16
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+      };
+    });
+
+    // 2 leads marked DIDNT_RECEIVE and SWITCH_OFF during the current day (todayDate = 2026-11-16)
+    // Must remain tagged with DIDNT_RECEIVE / SWITCH_OFF and appear in Calls Dialed Today, NOT prematurely released!
+    const currentDayDialedLeads: LeadRecord[] = [
+      {
+        ...makeFreshLead(3001),
+        id: 'dialed-today-dr',
+        status: 'DIDNT_RECEIVE',
+        callAttempts: 1,
+        didntReceiveCount: 1,
+        lastCalledDate: `${todayDate}T06:30:00.000Z`,
+        cooldownUntil: '2026-11-18T06:30:00.000Z',
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+      },
+      {
+        ...makeFreshLead(3002),
+        id: 'dialed-today-so',
+        status: 'SWITCH_OFF',
+        callAttempts: 1,
+        switchOffCount: 1,
+        lastCalledDate: `${todayDate}T07:00:00.000Z`,
+        cooldownUntil: '2026-11-18T07:00:00.000Z',
+        lastCalledByEmail: repEmail,
+        lastCalledByName: repName,
+      },
+    ];
+
+    // Intentionally place cooled-down retry leads at the front of the input array to verify
+    // that the partitioner & sorter strictly move them to the tail end (indices 1688..1698)!
+    const mixedInputPool: LeadRecord[] = [
+      ...cooledDownRetryLeads,
+      ...currentDayDialedLeads,
+      ...untouchedLeads,
+    ];
+
+    const partitioned = partitionFreshLeadsEquallyForActiveRepsPure(
+      mixedInputPool,
+      [],
+      1, // 1 batch for 1,699 leads example
+      todayDate,
+      resetNow,
+      true
+    );
+
+    assert.equal(partitioned.todayBatches.length, 1);
+    const batch1 = partitioned.todayBatches[0];
+    assert.equal(batch1.totalLeads, 1699);
+    assert.equal(batch1.untouchedCount, 1688);
+    assert.equal(batch1.retryCount, 11);
+
+    const batchLeadIds = batch1.leadIds || [];
+    assert.equal(batchLeadIds.length, 1699);
+
+    // Verify indices 0..1687 (1 through 1,688) are ALL untouched fresh leads
+    for (let i = 0; i < 1688; i++) {
+      assert.ok(
+        batchLeadIds[i].startsWith('untouched-'),
+        `Expected index ${i} to be an untouched lead, got ${batchLeadIds[i]}`
+      );
+    }
+
+    // Verify indices 1688..1698 (1,689 through 1,699) at the tail end are ALL cooled-down retry leads
+    for (let i = 1688; i < 1699; i++) {
+      assert.ok(
+        batchLeadIds[i].startsWith('retry-cooled-'),
+        `Expected tail index ${i} to be a cooled-down retry lead, got ${batchLeadIds[i]}`
+      );
+    }
+
+    // Verify current-day DIDNT_RECEIVE and SWITCH_OFF leads were NOT released into the batch
+    const stillTodayDr = partitioned.updatedLeads.find((l) => l.id === 'dialed-today-dr')!;
+    const stillTodaySo = partitioned.updatedLeads.find((l) => l.id === 'dialed-today-so')!;
+    assert.equal(stillTodayDr.status, 'DIDNT_RECEIVE');
+    assert.equal(stillTodayDr.assignedBatchId, null);
+    assert.equal(stillTodaySo.status, 'SWITCH_OFF');
+    assert.equal(stillTodaySo.assignedBatchId, null);
+
+    // Verify Sales Rep opening their claimed daily batch sees untouched leads first (0..1687) and retries at the tail (1688..1698)
+    const claimedBatch1: BatchRecord = {
+      ...batch1,
+      status: 'IN_PROGRESS',
+      claimedByEmail: repEmail,
+      claimedByName: repName,
+      claimedAt: `${todayDate}T04:00:00.000Z`,
+    };
+
+    const repQueueRes = filterAndSortWorkspaceTableLeadsPure({
+      leads: partitioned.updatedLeads,
+      batches: [claimedBatch1],
+      tab: 'FRESH',
+      isOwner: false,
+      userEmail: repEmail,
+      todayDate,
+    });
+
+    assert.equal(repQueueRes.filteredLeads.length, 1699);
+    for (let i = 0; i < 1688; i++) {
+      assert.ok(repQueueRes.filteredLeads[i].id.startsWith('untouched-'));
+      assert.equal(repQueueRes.filteredLeads[i].callAttempts, 0);
+    }
+    for (let i = 1688; i < 1699; i++) {
+      assert.ok(repQueueRes.filteredLeads[i].id.startsWith('retry-cooled-'));
+      assert.ok((repQueueRes.filteredLeads[i].callAttempts || 0) >= 1);
+    }
+  });
+
+  it('29. UI Polish: formatRepName keeps only first and middle names (first 2 words) and Interested metric box count is computed for both Owner and Sales Rep strips', () => {
+    assert.equal(formatRepName('Savani Hasti Vijaybhai'), 'Savani Hasti');
+    assert.equal(formatRepName('Dhami Krina Rajeshbhai'), 'Dhami Krina');
+    assert.equal(formatRepName('Savani Hasti Vijaybhai (Sales Rep)'), 'Savani Hasti');
+    assert.equal(formatRepName('Katariyaisha'), 'Katariyaisha');
+    assert.equal(formatRepName(null), '—');
+    assert.equal(formatRepName('   '), '—');
+
+    const repEmail = 'hastisavani.07@solarithmdesign.com';
+    const interestedLead: LeadRecord = {
+      ...makeFreshLead(3001),
+      status: 'INTERESTED',
+      assignedRepEmail: repEmail,
+      assignedRepName: 'Savani Hasti Vijaybhai',
+      lastCalledByEmail: repEmail,
+      lastCalledByName: 'Savani Hasti Vijaybhai',
+      lastCalledDate: '2026-11-16T09:00:00.000Z',
+    };
+
+    assert.equal(formatLastCalledByRepNamePure(interestedLead), 'Savani Hasti');
+
+    const ownerStrip = computeOwnerMetricStripPure([interestedLead], [], []);
+    assert.equal(ownerStrip.interestedOwnerQueue, 1);
+
+    const salesStrip = computeSalesRepMetricStripPure([interestedLead], [], repEmail);
+    assert.equal(salesStrip.interestedCount, 1);
   });
 });

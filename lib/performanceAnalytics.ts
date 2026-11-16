@@ -509,8 +509,10 @@ export function applyCallDispositionUpdatePure(
       nextSwitchOff += 1;
       if (nextSwitchOff >= 3) {
         finalStatus = 'SWITCH_OFF_DEAD';
+        nextCooldown = null;
+      } else {
+        nextCooldown = computeCooldownUntil(callDateIso);
       }
-      nextCooldown = null;
       nextFollowUp = null;
     } else if (
       params.newStatus === 'PROPOSAL_SHARED' ||
@@ -741,78 +743,35 @@ function getRepCallDatesOnLead(
 }
 
 /**
- * Module 5.2: Scorecard `NEW LEADS` Metric
- * Resolves the date (within `bounds`) when a sales rep engaged a lead whose prior status was `FRESH`
- * (first transition away from `FRESH`) OR manually created a new lead via `+ Add Lead`.
+ * Requirement 4: Separate Manual Lead Additions from Daily Dials
+ * `New Leads Added` must strictly count leads created manually via the `+ Add Lead` modal
+ * (`lead.source === 'manual'` or `!lead.importBatchId && Boolean(lead.createdByEmail)`).
+ * Never mix dialed batch calls into the manual lead creation metric.
  */
-function getRepFreshEngagedDatesOnLead(
+export function isManualLeadAdditionPure(lead: LeadRecord): boolean {
+  if (lead.source === 'manual') return true;
+  if (lead.importBatchId) return false;
+  return Boolean(lead.createdByEmail && lead.createdByEmail.trim());
+}
+
+function getRepManualLeadCreatedDates(
   lead: LeadRecord,
   repEmailLower: string,
   bounds: ResolvedDateBounds
 ): string[] {
+  if (!isManualLeadAdditionPure(lead)) return [];
   const targetCanonical = normalizeRepIdentityEmail(repEmailLower, null) || repEmailLower;
-  const attributedRep = resolveAttributedRepEmailForLead(lead);
-
-  if (Array.isArray(lead.callHistory) && lead.callHistory.length > 0) {
-    const firstFreshEntry = lead.callHistory.find(
-      (e) =>
-        (e.previousStatus === 'FRESH' || e.previousStatus === 'REVIVED_FRESH') &&
-        e.newStatus !== 'FRESH' &&
-        e.newStatus !== 'REVIVED_FRESH'
-    );
-    if (firstFreshEntry) {
-      const entryRaw = firstFreshEntry.repEmail?.toLowerCase().trim();
-      const entryCanonical = normalizeRepIdentityEmail(
-        firstFreshEntry.repEmail,
-        firstFreshEntry.repName
-      );
-      if (
-        (entryCanonical === targetCanonical ||
-          entryRaw === repEmailLower ||
-          (entryRaw === 'historical@solarithmdesign.com' &&
-            attributedRep === targetCanonical)) &&
-        isIsoTimestampWithinBounds(firstFreshEntry.timestamp, bounds)
-      ) {
-        return [firstFreshEntry.timestamp.slice(0, 10)];
-      }
-      return [];
-    }
-  }
-
-  // Fallback for leads engaged from FRESH without explicit callHistory array (e.g., direct disposition or batch call)
-  const isTransitionedFromFresh =
-    lead.status !== 'FRESH' &&
-    lead.status !== 'REVIVED_FRESH' &&
-    ((lead.callAttempts || 0) > 0 || Boolean(lead.lastCalledDate));
-
-  if (isTransitionedFromFresh) {
-    const callerCanonical =
-      normalizeRepIdentityEmail(
-        lead.assignedRepEmail || lead.lastCalledByEmail,
-        lead.assignedRepName || lead.lastCalledByName
-      ) || attributedRep;
-    const effectiveTs = lead.lastCalledDate || lead.updatedAt || lead.createdAt;
-    if (
-      callerCanonical === targetCanonical &&
-      isIsoTimestampWithinBounds(effectiveTs, bounds)
-    ) {
-      return [effectiveTs.slice(0, 10)];
-    }
-  }
-
-  // Also include uncalled leads manually added via "+ Add Lead" by this rep
+  const createdByRaw = lead.createdByEmail?.toLowerCase().trim();
   const createdByCanonical = normalizeRepIdentityEmail(
     lead.createdByEmail,
     lead.createdByName
   );
   if (
-    createdByCanonical === targetCanonical &&
-    !lead.importBatchId &&
+    (createdByCanonical === targetCanonical || createdByRaw === repEmailLower) &&
     isIsoTimestampWithinBounds(lead.createdAt, bounds)
   ) {
     return [lead.createdAt.slice(0, 10)];
   }
-
   return [];
 }
 
@@ -1044,23 +1003,22 @@ export function computeOwnerAnalyticsPure(
         }
       }
 
-      // 2. Module 5.2: Scorecard `NEW LEADS` Metric
-      // Increments whenever a sales rep engages a lead whose prior status was FRESH (or adds a new lead)
-      const freshEngagedInPeriod = getRepFreshEngagedDatesOnLead(
+      // 2. Requirement 4: `New Leads Added` strictly counts leads created manually via `+ Add Lead` modal
+      const manualCreatedInPeriod = getRepManualLeadCreatedDates(
         lead,
         rep.repEmail,
         bounds
       );
-      if (freshEngagedInPeriod.length > 0) {
+      if (manualCreatedInPeriod.length > 0) {
         newLeadsAdded += 1;
       }
 
-      const freshEngagedForChart = getRepFreshEngagedDatesOnLead(
+      const manualCreatedForChart = getRepManualLeadCreatedDates(
         lead,
         rep.repEmail,
         allRangeBounds
       );
-      for (const ymd of freshEngagedForChart) {
+      for (const ymd of manualCreatedForChart) {
         const outBucket = dailyOutcomeMap.get(ymd);
         if (outBucket) {
           outBucket.newLeadsAdded += 1;
@@ -1548,15 +1506,7 @@ export function computeDailyOutcomeSplineSeriesForRepsPure(
     const matchesFilterForAttributed =
       !targetRepEmails || targetRepEmails.has(attributedRep);
 
-    if (attributedRep && matchesFilterForAttributed) {
-      const freshDates = getRepFreshEngagedDatesOnLead(lead, attributedRep, bounds);
-      for (const fYmd of freshDates) {
-        const b = bucketMap.get(fYmd);
-        if (b) {
-          b.newLeadsAdded += 1;
-        }
-      }
-    } else if (!lead.importBatchId && lead.createdAt && matchesFilterForCreated) {
+    if (isManualLeadAdditionPure(lead) && lead.createdAt && matchesFilterForCreated) {
       const createdYmd = lead.createdAt.slice(0, 10);
       const b = bucketMap.get(createdYmd);
       if (b) {
@@ -1938,21 +1888,21 @@ export function computeSalesRepAnalyticsPure(
       }
     }
 
-    const freshEngagedPeriod = getRepFreshEngagedDatesOnLead(
+    const manualCreatedPeriod = getRepManualLeadCreatedDates(
       lead,
       repCanonicalEmail,
       bounds
     );
-    if (freshEngagedPeriod.length > 0) {
+    if (manualCreatedPeriod.length > 0) {
       newLeadsAddedByMe += 1;
     }
 
-    const freshEngagedChart = getRepFreshEngagedDatesOnLead(
+    const manualCreatedChart = getRepManualLeadCreatedDates(
       lead,
       repCanonicalEmail,
       chartRangeBounds
     );
-    for (const fYmd of freshEngagedChart) {
+    for (const fYmd of manualCreatedChart) {
       const bucket = dailyMap.get(fYmd);
       if (bucket) {
         bucket.newLeadsAdded += 1;

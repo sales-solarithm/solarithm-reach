@@ -504,7 +504,7 @@ export function computeOperationalDatesForStatus(
   }
 
   const cooldownUntil =
-    status === 'DIDNT_RECEIVE'
+    status === 'DIDNT_RECEIVE' || status === 'SWITCH_OFF'
       ? new Date(baseMs + 48 * 60 * 60 * 1000).toISOString()
       : null;
 
@@ -1297,6 +1297,37 @@ export async function syncLeadsToFirestore(leadsToSync: LeadRecord[]): Promise<v
   }
 }
 
+/**
+ * Requirement 2: Fix Counter Drift (`completedCallsCount` vs `Calls Dialed Today`)
+ * Atomically commits the updated `LeadRecord` and the updated `BatchRecord` (`completedCallsCount` & `remainingLeads`)
+ * within the exact same Firestore `writeBatch` so batch counters and global daily call counts never drift.
+ */
+export async function commitCallOutcomeAtomicToFirestore(params: {
+  updatedLead: LeadRecord;
+  updatedBatch?: BatchRecord | null;
+}): Promise<void> {
+  if (!hasLiveReachFirebaseConfig()) return;
+  try {
+    const wb = writeBatch(db);
+    wb.set(
+      doc(db, 'leads', params.updatedLead.id),
+      sanitizeFirestorePayload(params.updatedLead),
+      { merge: true }
+    );
+    if (params.updatedBatch && params.updatedBatch.batchId) {
+      wb.set(
+        doc(db, 'batches', params.updatedBatch.batchId),
+        sanitizeFirestorePayload(params.updatedBatch),
+        { merge: true }
+      );
+    }
+    await wb.commit();
+  } catch (err) {
+    reportCloudSyncError(err, 'commitCallOutcomeAtomicToFirestore');
+    throw err;
+  }
+}
+
 export function formatOwnerSubStatusBadgePure(
   subStatus?: OwnerSubStatus | null
 ): { label: string; classes: string; effectiveSubStatus: OwnerSubStatus } {
@@ -1395,10 +1426,14 @@ export function doesLeadMatchInterestedSubFilterPure(
 }
 
 export type WorkspaceFilterTab =
+  | 'TO_CALL_TODAY'
   | 'FRESH'
+  | 'ALL_LEADS'
   | 'PROPOSAL_SHARED'
   | 'FUTURE_REQUIREMENT'
-  | 'INTERESTED';
+  | 'INTERESTED'
+  | 'CALLS_DIALED_TODAY'
+  | 'DEAD_CLOSED_OUT';
 
 export interface WorkspaceTableFilterParams {
   leads: LeadRecord[];
@@ -1407,6 +1442,7 @@ export interface WorkspaceTableFilterParams {
   isOwner: boolean;
   userEmail: string;
   todayDate: string;
+  nowIso?: string;
   selectedBatchIdFilter?: string | null;
   selectedRepEmailFilter?: string | null;
   interestedSubFilter?: InterestedSubFilter;
@@ -1420,14 +1456,97 @@ export interface WorkspaceTableFilterResult {
   emptyStateMessage: string;
 }
 
+const DEAD_CLOSED_STATUSES_SET: ReadonlySet<LeadStatus> = new Set<LeadStatus>([
+  'LEAD_LOST',
+  'NOT_INTERESTED',
+  'NOT_A_SOLAR_COMPANY',
+  'SWITCH_OFF_DEAD',
+  'DIDNT_RECEIVE_DEAD',
+  'CLOSED_WON',
+]);
+
+function matchesSearchQueryOnLead(lead: LeadRecord, q: string): boolean {
+  if (!q) return true;
+  const matchName = lead.companyName.toLowerCase().includes(q);
+  const matchPhone =
+    lead.phoneNumber.includes(q) ||
+    Boolean(lead.altNumber && lead.altNumber.includes(q));
+  const matchLoc =
+    Boolean(lead.city && lead.city.toLowerCase().includes(q)) ||
+    Boolean(lead.state && lead.state.toLowerCase().includes(q));
+  return matchName || matchPhone || matchLoc;
+}
+
+function isCooldownExpiredForPriorityQueue(
+  lead: LeadRecord,
+  nowMs: number,
+  todayDate?: string
+): boolean {
+  if (todayDate && lead.lastCalledDate && lead.lastCalledDate.slice(0, 10) >= todayDate) {
+    return false;
+  }
+  if (lead.cooldownUntil) {
+    const cMs = new Date(lead.cooldownUntil).getTime();
+    if (!Number.isNaN(cMs)) {
+      return cMs <= nowMs;
+    }
+  }
+  if (
+    (lead.status === 'DIDNT_RECEIVE' || lead.status === 'SWITCH_OFF') &&
+    lead.lastCalledDate
+  ) {
+    const calledMs = new Date(lead.lastCalledDate).getTime();
+    if (!Number.isNaN(calledMs)) {
+      return calledMs + 48 * 60 * 60 * 1000 <= nowMs;
+    }
+  }
+  return true;
+}
+
+function isUntouchedFreshBatchLead(lead: LeadRecord): boolean {
+  return (
+    lead.status === 'FRESH' &&
+    (lead.callAttempts || 0) === 0 &&
+    (lead.didntReceiveCount || 0) === 0 &&
+    (lead.switchOffCount || 0) === 0
+  );
+}
+
+function sortBatchQueueUntouchedFirstRetriesTail(
+  leads: LeadRecord[],
+  batchLeadIds?: string[]
+): LeadRecord[] {
+  const indexMap = new Map<string, number>();
+  if (Array.isArray(batchLeadIds)) {
+    for (let i = 0; i < batchLeadIds.length; i++) {
+      indexMap.set(batchLeadIds[i], i);
+    }
+  }
+  return [...leads].sort((a, b) => {
+    const priorityA = isUntouchedFreshBatchLead(a) ? 0 : 1;
+    const priorityB = isUntouchedFreshBatchLead(b) ? 0 : 1;
+    if (priorityA !== priorityB) {
+      return priorityA - priorityB;
+    }
+    const idxA = indexMap.get(a.id);
+    const idxB = indexMap.get(b.id);
+    if (idxA !== undefined && idxB !== undefined && idxA !== idxB) {
+      return idxA - idxB;
+    }
+    return 0;
+  });
+}
+
 /**
- * Pure query/filter engine for the 4 consolidated Outreach Workspace tabs:
+ * Pure query/filter engine for the Outreach Workspace tabs & Top Metric Card Inspectors:
+ * 0. `🔥 To-Call Today` (`TO_CALL_TODAY`): Due follow-ups (`PROPOSAL_SHARED` & `FUTURE_REQUIREMENT`) + 48h cooldown-expired retries (`DIDNT_RECEIVE` & `SWITCH_OFF`)
  * 1. `Today's Batch / Fresh` (`FRESH`)
- * 2. `Proposals Shared` (`PROPOSAL_SHARED`)
- * 3. `Future Requirement` (`FUTURE_REQUIREMENT`)
- * 4. `Interested (Owner Queue)` (`INTERESTED`)
- *
- * Strictly prohibits dumping unclaimed global pool leads into the table.
+ * 2. `All Leads & Attempt History` (`ALL_LEADS` — Owner Master Lead Table showing all leads with latest status updated)
+ * 3. `Proposals Shared` (`PROPOSAL_SHARED`)
+ * 4. `Future Requirement` (`FUTURE_REQUIREMENT`)
+ * 5. `Interested (Owner Queue)` (`INTERESTED`)
+ * 6. `Calls Dialed Today` (`CALLS_DIALED_TODAY`)
+ * 7. `Dead / Closed Out` (`DEAD_CLOSED_OUT`)
  */
 export function filterAndSortWorkspaceTableLeadsPure(
   params: WorkspaceTableFilterParams
@@ -1439,6 +1558,7 @@ export function filterAndSortWorkspaceTableLeadsPure(
     isOwner,
     userEmail,
     todayDate,
+    nowIso,
     selectedBatchIdFilter = null,
     selectedRepEmailFilter = null,
     interestedSubFilter = 'ALL',
@@ -1455,6 +1575,7 @@ export function filterAndSortWorkspaceTableLeadsPure(
       ? selectedBatchIdFilter.trim()
       : null;
   const q = String(searchQuery || '').trim().toLowerCase();
+  const effectiveNowMs = nowIso ? new Date(nowIso).getTime() : Date.now();
 
   // Today's active (non-closed) batches
   const todayActiveBatches = batches
@@ -1472,6 +1593,223 @@ export function filterAndSortWorkspaceTableLeadsPure(
           areRepEmailsEquivalentPure(b.claimedByEmail, userEmailLower, b.claimedByName)
       ) || null
     : null;
+
+  // TAB 0: 🔥 To-Call Today (Follow-Ups & Cooldown-Expired Retries)
+  if (tab === 'TO_CALL_TODAY') {
+    const priorityLeads = leads.filter((lead) => {
+      if (!matchesSearchQueryOnLead(lead, q)) return false;
+
+      const belongsToRep = isOwner
+        ? !repFilterLower ||
+          areRepEmailsEquivalentPure(
+            lead.assignedRepEmail || lead.lastCalledByEmail,
+            repFilterLower,
+            lead.assignedRepName || lead.lastCalledByName
+          )
+        : areRepEmailsEquivalentPure(
+            lead.assignedRepEmail || lead.lastCalledByEmail,
+            userEmailLower,
+            lead.assignedRepName || lead.lastCalledByName
+          ) ||
+          Boolean(
+            repClaimedTodayBatch &&
+              (lead.assignedBatchId === repClaimedTodayBatch.batchId ||
+                repClaimedTodayBatch.leadIds?.includes(lead.id))
+          );
+
+      if (!belongsToRep) return false;
+
+      // 1. PROPOSAL_SHARED due for follow-up today or overdue
+      if (lead.status === 'PROPOSAL_SHARED') {
+        if (!lead.nextFollowUpDate) return true;
+        return lead.nextFollowUpDate.slice(0, 10) <= todayDate;
+      }
+
+      // 2. FUTURE_REQUIREMENT due for follow-up today or overdue
+      if (lead.status === 'FUTURE_REQUIREMENT') {
+        if (!lead.nextFollowUpDate) return true;
+        return lead.nextFollowUpDate.slice(0, 10) <= todayDate;
+      }
+
+      // 3. DIDNT_RECEIVE or SWITCH_OFF (or revived FRESH with retry count > 0) whose 48h cooldown has expired
+      const isRetryCandidate =
+        lead.status === 'DIDNT_RECEIVE' ||
+        lead.status === 'SWITCH_OFF' ||
+        ((lead.status === 'FRESH' || lead.status === 'REVIVED_FRESH') &&
+          ((lead.didntReceiveCount || 0) > 0 || (lead.switchOffCount || 0) > 0));
+
+      if (
+        isRetryCandidate &&
+        (lead.didntReceiveCount || 0) < 10 &&
+        (lead.switchOffCount || 0) < 3
+      ) {
+        return isCooldownExpiredForPriorityQueue(lead, effectiveNowMs, todayDate);
+      }
+
+      return false;
+    });
+
+    const sortedPriority = [...priorityLeads].sort((a, b) => {
+      const rank = (l: LeadRecord) => {
+        if (l.status === 'PROPOSAL_SHARED') return 1;
+        if (l.status === 'FUTURE_REQUIREMENT') return 2;
+        return 3;
+      };
+      const rDiff = rank(a) - rank(b);
+      if (rDiff !== 0) return rDiff;
+      const dateA = a.nextFollowUpDate || a.lastCalledDate || a.updatedAt || '';
+      const dateB = b.nextFollowUpDate || b.lastCalledDate || b.updatedAt || '';
+      return String(dateA).localeCompare(String(dateB));
+    });
+
+    return {
+      filteredLeads: sortedPriority,
+      todayActiveBatches,
+      repClaimedTodayBatch,
+      emptyStateMessage:
+        'No due follow-ups or cooldown-expired retry leads for today. Proceed to Today’s Batch / Fresh.',
+    };
+  }
+
+  // TAB: Owner Master Lead Table (`ALL_LEADS` — All Leads & Attempt History with latest status updated)
+  if (tab === 'ALL_LEADS') {
+    const batchLeadIdsSet = new Set<string>();
+    if (batchFilterId) {
+      const targetBatch = batches.find((b) => b.batchId === batchFilterId);
+      for (const lid of targetBatch?.leadIds || []) {
+        batchLeadIdsSet.add(lid);
+      }
+    }
+
+    const masterLeads = leads.filter((lead) => {
+      if (!matchesSearchQueryOnLead(lead, q)) return false;
+
+      if (batchFilterId) {
+        const inSelectedBatch =
+          lead.assignedBatchId === batchFilterId || batchLeadIdsSet.has(lead.id);
+        if (!inSelectedBatch) return false;
+      }
+
+      if (repFilterLower) {
+        const parentBatch = lead.assignedBatchId
+          ? todayBatchById.get(lead.assignedBatchId)
+          : undefined;
+        const matchesLeadRep = areRepEmailsEquivalentPure(
+          lead.assignedRepEmail || lead.lastCalledByEmail,
+          repFilterLower,
+          lead.assignedRepName || lead.lastCalledByName
+        );
+        const matchesBatchRep = parentBatch
+          ? areRepEmailsEquivalentPure(
+              parentBatch.claimedByEmail,
+              repFilterLower,
+              parentBatch.claimedByName
+            )
+          : false;
+        if (!matchesLeadRep && !matchesBatchRep) return false;
+      }
+
+      return true;
+    });
+
+    const sortedMaster = [...masterLeads].sort((a, b) => {
+      // Show called/updated leads with attempt history or most recent activity first
+      const attemptsDiff = (b.callAttempts || 0) - (a.callAttempts || 0);
+      if (attemptsDiff !== 0) return attemptsDiff;
+      return String(b.lastCalledDate || b.updatedAt || '').localeCompare(
+        String(a.lastCalledDate || a.updatedAt || '')
+      );
+    });
+
+    return {
+      filteredLeads: sortedMaster,
+      todayActiveBatches,
+      repClaimedTodayBatch,
+      emptyStateMessage: 'No leads match the current Master Lead Table filters.',
+    };
+  }
+
+  // TAB: Calls Dialed Today (`CALLS_DIALED_TODAY` — Top Metric Card Inspector)
+  if (tab === 'CALLS_DIALED_TODAY') {
+    const todayUtc = new Date().toISOString().slice(0, 10);
+    const dialedTodayLeads = leads.filter((lead) => {
+      if (lead.status === 'FRESH' || lead.status === 'REVIVED_FRESH') return false;
+      if (!matchesSearchQueryOnLead(lead, q)) return false;
+
+      const calledToday = Boolean(
+        lead.lastCalledDate &&
+          (lead.lastCalledDate.startsWith(todayDate) ||
+            lead.lastCalledDate.startsWith(todayUtc))
+      );
+      if (!calledToday) return false;
+
+      if (!isOwner) {
+        return areRepEmailsEquivalentPure(
+          lead.lastCalledByEmail || lead.assignedRepEmail,
+          userEmailLower,
+          lead.lastCalledByName || lead.assignedRepName
+        );
+      }
+      if (repFilterLower) {
+        return areRepEmailsEquivalentPure(
+          lead.lastCalledByEmail || lead.assignedRepEmail,
+          repFilterLower,
+          lead.lastCalledByName || lead.assignedRepName
+        );
+      }
+      return true;
+    });
+
+    const sortedDialed = [...dialedTodayLeads].sort((a, b) =>
+      String(b.lastCalledDate || b.updatedAt || '').localeCompare(
+        String(a.lastCalledDate || a.updatedAt || '')
+      )
+    );
+
+    return {
+      filteredLeads: sortedDialed,
+      todayActiveBatches,
+      repClaimedTodayBatch,
+      emptyStateMessage: 'No calls dialed today yet.',
+    };
+  }
+
+  // TAB: Dead / Closed Out (`DEAD_CLOSED_OUT` — Top Metric Card Inspector)
+  if (tab === 'DEAD_CLOSED_OUT') {
+    const deadLeads = leads.filter((lead) => {
+      if (!DEAD_CLOSED_STATUSES_SET.has(lead.status)) return false;
+      if (!matchesSearchQueryOnLead(lead, q)) return false;
+
+      if (!isOwner) {
+        return areRepEmailsEquivalentPure(
+          lead.assignedRepEmail || lead.lastCalledByEmail,
+          userEmailLower,
+          lead.assignedRepName || lead.lastCalledByName
+        );
+      }
+      if (repFilterLower) {
+        return areRepEmailsEquivalentPure(
+          lead.assignedRepEmail || lead.lastCalledByEmail,
+          repFilterLower,
+          lead.assignedRepName || lead.lastCalledByName
+        );
+      }
+      return true;
+    });
+
+    const sortedDead = [...deadLeads].sort((a, b) =>
+      String(b.lastCalledDate || b.updatedAt || '').localeCompare(
+        String(a.lastCalledDate || a.updatedAt || '')
+      )
+    );
+
+    return {
+      filteredLeads: sortedDead,
+      todayActiveBatches,
+      repClaimedTodayBatch,
+      emptyStateMessage: 'No leads currently in Dead / Closed Out.',
+    };
+  }
 
   // TAB 1: Today's Batch / Fresh
   if (tab === 'FRESH') {
@@ -1495,22 +1833,16 @@ export function filterAndSortWorkspaceTableLeadsPure(
           lead.assignedBatchId === repClaimedTodayBatch.batchId ||
           Boolean(repClaimedTodayBatch.leadIds?.includes(lead.id));
         if (!matchesBatch) return false;
-
-        if (q) {
-          const matchName = lead.companyName.toLowerCase().includes(q);
-          const matchPhone =
-            lead.phoneNumber.includes(q) ||
-            Boolean(lead.altNumber && lead.altNumber.includes(q));
-          const matchLoc =
-            Boolean(lead.city && lead.city.toLowerCase().includes(q)) ||
-            Boolean(lead.state && lead.state.toLowerCase().includes(q));
-          if (!matchName && !matchPhone && !matchLoc) return false;
-        }
-        return true;
+        return matchesSearchQueryOnLead(lead, q);
       });
 
+      const sortedRepBatchLeads = sortBatchQueueUntouchedFirstRetriesTail(
+        repBatchLeads,
+        repClaimedTodayBatch.leadIds
+      );
+
       return {
-        filteredLeads: repBatchLeads,
+        filteredLeads: sortedRepBatchLeads,
         todayActiveBatches,
         repClaimedTodayBatch,
         emptyStateMessage:
@@ -1548,21 +1880,19 @@ export function filterAndSortWorkspaceTableLeadsPure(
           return false;
         }
       }
-      if (q) {
-        const matchName = lead.companyName.toLowerCase().includes(q);
-        const matchPhone =
-          lead.phoneNumber.includes(q) ||
-          Boolean(lead.altNumber && lead.altNumber.includes(q));
-        const matchLoc =
-          Boolean(lead.city && lead.city.toLowerCase().includes(q)) ||
-          Boolean(lead.state && lead.state.toLowerCase().includes(q));
-        if (!matchName && !matchPhone && !matchLoc) return false;
-      }
-      return true;
+      return matchesSearchQueryOnLead(lead, q);
     });
 
+    const selectedBatchLeadIds = batchFilterId
+      ? todayBatchById.get(batchFilterId)?.leadIds
+      : undefined;
+    const sortedOwnerBatchLeads = sortBatchQueueUntouchedFirstRetriesTail(
+      ownerBatchLeads,
+      selectedBatchLeadIds
+    );
+
     return {
-      filteredLeads: ownerBatchLeads,
+      filteredLeads: sortedOwnerBatchLeads,
       todayActiveBatches,
       repClaimedTodayBatch: null,
       emptyStateMessage:
@@ -1599,18 +1929,7 @@ export function filterAndSortWorkspaceTableLeadsPure(
         }
       }
 
-      if (q) {
-        const matchName = lead.companyName.toLowerCase().includes(q);
-        const matchPhone =
-          lead.phoneNumber.includes(q) ||
-          Boolean(lead.altNumber && lead.altNumber.includes(q));
-        const matchLoc =
-          Boolean(lead.city && lead.city.toLowerCase().includes(q)) ||
-          Boolean(lead.state && lead.state.toLowerCase().includes(q));
-        if (!matchName && !matchPhone && !matchLoc) return false;
-      }
-
-      return true;
+      return matchesSearchQueryOnLead(lead, q);
     });
 
     // Sort by nextFollowUpDate ascending so overdue 2-day / 30-day follow-ups appear at the top
@@ -1666,18 +1985,7 @@ export function filterAndSortWorkspaceTableLeadsPure(
       if (!matchesAssigned && !matchesEscalated) return false;
     }
 
-    if (q) {
-      const matchName = lead.companyName.toLowerCase().includes(q);
-      const matchPhone =
-        lead.phoneNumber.includes(q) ||
-        Boolean(lead.altNumber && lead.altNumber.includes(q));
-      const matchLoc =
-        Boolean(lead.city && lead.city.toLowerCase().includes(q)) ||
-        Boolean(lead.state && lead.state.toLowerCase().includes(q));
-      if (!matchName && !matchPhone && !matchLoc) return false;
-    }
-
-    return true;
+    return matchesSearchQueryOnLead(lead, q);
   });
 
   const sortedInterested = [...interestedLeads].sort((a, b) => {

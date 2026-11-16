@@ -80,6 +80,9 @@ export interface EqualDailyBatchPartitionResult {
   batchSizePerRep: number;
 }
 
+export const DIDNT_RECEIVE_COOLDOWN_HOURS = 48;
+export const SWITCH_OFF_RETRY_HOURS = 48;
+
 /**
  * Computes the 48-hour cooldown ISO timestamp from a call date.
  */
@@ -89,13 +92,82 @@ export function computeCooldownUntil(callDateIso: string, hours = COOLDOWN_HOURS
 }
 
 /**
- * Checks if a lead is currently locked under a 48-hour cooldown.
+ * Checks if a lead is currently locked under a mandatory cooldown window
+ * (`DIDNT_RECEIVE` >= 48 hours; `SWITCH_OFF` >= configured retry interval).
  */
-export function isLeadOnCooldown(lead: Pick<LeadRecord, 'cooldownUntil'>, now: Date = new Date()): boolean {
-  if (!lead.cooldownUntil) return false;
-  const cooldownTime = new Date(lead.cooldownUntil).getTime();
-  if (Number.isNaN(cooldownTime)) return false;
-  return cooldownTime > now.getTime();
+export function isLeadOnCooldown(
+  lead: Pick<LeadRecord, 'cooldownUntil' | 'status' | 'lastCalledDate'>,
+  now: Date = new Date(),
+  switchOffRetryHours: number = SWITCH_OFF_RETRY_HOURS
+): boolean {
+  const nowMs = now.getTime();
+  if (lead.cooldownUntil) {
+    const cooldownTime = new Date(lead.cooldownUntil).getTime();
+    if (!Number.isNaN(cooldownTime)) {
+      return cooldownTime > nowMs;
+    }
+  }
+  if (
+    (lead.status === 'DIDNT_RECEIVE' || lead.status === 'SWITCH_OFF') &&
+    lead.lastCalledDate
+  ) {
+    const calledMs = new Date(lead.lastCalledDate).getTime();
+    if (!Number.isNaN(calledMs)) {
+      const requiredHours =
+        lead.status === 'SWITCH_OFF'
+          ? switchOffRetryHours
+          : DIDNT_RECEIVE_COOLDOWN_HOURS;
+      return calledMs + requiredHours * 60 * 60 * 1000 > nowMs;
+    }
+  }
+  return false;
+}
+
+/**
+ * Priority 1 (Top of Batch): Untouched fresh leads (`status === 'FRESH'` and `callAttempts === 0` and no prior retry counts).
+ * Priority 2 (Bottom of Batch / Tail End): Re-entry / retry leads (`DIDNT_RECEIVE` or `SWITCH_OFF` that have cleared cooldown, or leads with `callAttempts > 0`).
+ */
+export function isUntouchedPriority1LeadPure(
+  lead: Pick<
+    LeadRecord,
+    'status' | 'callAttempts' | 'didntReceiveCount' | 'switchOffCount'
+  >
+): boolean {
+  return (
+    lead.status === 'FRESH' &&
+    (lead.callAttempts || 0) === 0 &&
+    (lead.didntReceiveCount || 0) === 0 &&
+    (lead.switchOffCount || 0) === 0
+  );
+}
+
+/**
+ * Sorts a batch's leads so that:
+ * 1. Priority 1 (Top of Batch): All untouched fresh leads (`status == 'FRESH'` and `callAttempts == 0`) appear first.
+ * 2. Priority 2 (Bottom of Batch / Tail End): All cooled-down re-entry / retry leads (`DIDNT_RECEIVE` / `SWITCH_OFF` / `callAttempts > 0`) appear strictly at the tail end.
+ */
+export function sortBatchLeadsUntouchedFirstRetriesTailPure(
+  leads: LeadRecord[],
+  batchLeadIdsOrder?: string[]
+): LeadRecord[] {
+  const orderMap = new Map<string, number>();
+  if (Array.isArray(batchLeadIdsOrder)) {
+    for (let i = 0; i < batchLeadIdsOrder.length; i++) {
+      orderMap.set(batchLeadIdsOrder[i], i);
+    }
+  }
+  return [...leads].sort((a, b) => {
+    const pA = isUntouchedPriority1LeadPure(a) ? 0 : 1;
+    const pB = isUntouchedPriority1LeadPure(b) ? 0 : 1;
+    if (pA !== pB) return pA - pB;
+
+    const idxA = orderMap.get(a.id);
+    const idxB = orderMap.get(b.id);
+    if (idxA !== undefined && idxB !== undefined && idxA !== idxB) {
+      return idxA - idxB;
+    }
+    return 0;
+  });
 }
 
 /**
@@ -139,22 +211,61 @@ export function doesBatchBelongToTodayPure(
 }
 
 /**
- * Auto-Sweep Stale Batches & Prior-Day Uncalled FRESH Leads:
- * - Closes any batch where `batch.date < todayDate` (strictly past dates) and `batch.status !== 'CLOSED'` (`status = 'CLOSED'`).
- * - Releases any lead where `status === 'FRESH'` (or `'REVIVED_FRESH'`) and `assignedBatchId` belongs to a strictly past date
- *   (`batch.date < todayDate`) (`assignedBatchId = null`, `assignedRepEmail = null`, `assignedRepName = null`).
- * - NEVER sweeps or wipes batches or `FRESH` leads belonging to `todayDate`.
+ * Auto-Sweep Stale Batches, Prior-Day Uncalled FRESH Leads & Cooled-Down Re-Entry Leads:
+ * 1. Retention During Current Day:
+ *    - Leads marked `DIDNT_RECEIVE` or `SWITCH_OFF` during `todayDate` (`lastCalledDate` starts with `todayDate`)
+ *      remain tagged with their current status (`DIDNT_RECEIVE` / `SWITCH_OFF`) so they appear in `Calls Dialed Today`
+ *      and are NEVER prematurely pushed back into active circulation before the daily reset cycle.
+ * 2. Midnight / Daily Reset Sweep Execution:
+ *    - Checks all leads whose status is `DIDNT_RECEIVE` or `SWITCH_OFF` from prior days (`!lastCalledDate.startsWith(todayDate)`)
+ *      and whose `lastCalledDate` / `cooldownUntil` satisfies their required cooldown window (`DIDNT_RECEIVE` >= 48h, `SWITCH_OFF` >= retry interval).
+ *    - Releases those eligible re-entry leads back into the pool (`status: 'FRESH'`, `cooldownUntil: null`, `assignedBatchId: null`)
+ *      with their `callAttempts`, `didntReceiveCount`, and `switchOffCount` preserved so they are placed at the tail end of today's batches.
+ * 3. Closes any batch where `batch.date < todayDate` and releases prior-day uncalled `FRESH` leads.
  */
 export function autoSweepStaleBatchesAndReleaseLeadsPure(
   allLeads: LeadRecord[],
   existingBatches: DailyBatchDocument[],
   todayDate: string = getTodayIstDateString(),
-  nowIso: string = new Date().toISOString()
+  nowIso: string = new Date().toISOString(),
+  switchOffRetryHours: number = SWITCH_OFF_RETRY_HOURS
 ): StaleBatchSweepResult {
   const releasedCountByBatch = new Map<string, number>();
   const releasedLeads: LeadRecord[] = [];
 
+  const nowDate = new Date(nowIso);
   const sweptLeads = allLeads.map((lead) => {
+    const calledDateYmd = lead.lastCalledDate ? lead.lastCalledDate.slice(0, 10) : null;
+    const wasCalledToday = Boolean(calledDateYmd && calledDateYmd >= todayDate);
+
+    // Retention During Current Day: Never release a lead that was dialed today
+    if (
+      !wasCalledToday &&
+      (lead.status === 'DIDNT_RECEIVE' || lead.status === 'SWITCH_OFF') &&
+      (lead.didntReceiveCount || 0) < 10 &&
+      (lead.switchOffCount || 0) < 3 &&
+      Boolean(lead.cooldownUntil || lead.lastCalledDate) &&
+      !isLeadOnCooldown(lead, nowDate, switchOffRetryHours)
+    ) {
+      const preservedAttempts = Math.max(
+        1,
+        lead.callAttempts ||
+          (lead.didntReceiveCount || 0) + (lead.switchOffCount || 0)
+      );
+      const revived: LeadRecord = {
+        ...lead,
+        status: 'FRESH',
+        callAttempts: preservedAttempts,
+        cooldownUntil: null,
+        assignedBatchId: null,
+        assignedRepEmail: null,
+        assignedRepName: null,
+        updatedAt: nowIso,
+      };
+      releasedLeads.push(revived);
+      return revived;
+    }
+
     const isFreshLike = lead.status === 'FRESH' || lead.status === 'REVIVED_FRESH';
     const hasStaleAssignment =
       isFreshLike &&
@@ -228,10 +339,12 @@ export function fisherYatesShuffle<T>(items: T[], rng: () => number = Math.rando
 }
 
 /**
- * Automatically sweeps any prior-day batches/uncalled FRESH leads, deletes any extra/duplicate
- * batches (`batchNumber > N` or `CLOSED` batches for today), and divides all eligible `FRESH` leads
- * equally across strictly `1..N` active Sales Representatives (`BATCH_${todayDate}_01` .. `BATCH_${todayDate}_0N`)
- * with NO 3,000-lead cap.
+ * Automatically sweeps any prior-day batches/uncalled FRESH leads and cooled-down `DIDNT_RECEIVE` / `SWITCH_OFF`
+ * re-entry leads, deletes any extra/duplicate batches (`batchNumber > N` or `CLOSED` batches for today),
+ * and divides all eligible leads equally across strictly `1..N` active Sales Representatives
+ * (`BATCH_${todayDate}_01` .. `BATCH_${todayDate}_0N`) with strict tail-end placement for retry leads:
+ * - Priority 1 (Top of Batch): Untouched fresh leads (`status == 'FRESH'` and `callAttempts == 0`).
+ * - Priority 2 (Bottom of Batch / Tail End): Cooled-down re-entry / retry leads (`DIDNT_RECEIVE` / `SWITCH_OFF` / `callAttempts > 0`).
  */
 export function partitionFreshLeadsEquallyForActiveRepsPure(
   allLeads: LeadRecord[],
@@ -245,7 +358,8 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
   const nowIso = nowDate.toISOString();
   const safeRepCount = Math.max(1, Math.floor(activeRepCount || 3));
 
-  // Step 1: Automatically sweep any stale prior-day batches (date < todayDate) and release prior-day uncalled FRESH leads
+  // Step 1: Automatically sweep any stale prior-day batches (date < todayDate), release prior-day uncalled FRESH leads,
+  // and release prior-day DIDNT_RECEIVE / SWITCH_OFF leads whose 48h cooldown has cleared.
   const sweep = autoSweepStaleBatchesAndReleaseLeadsPure(
     allLeads,
     existingBatches,
@@ -409,20 +523,12 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
     };
   }
 
-  // Interleave untouched (callAttempts === 0) and cooldown-cleared retries so each batch gets an even mix
-  const untouched = poolToPartition.filter((l) => (l.callAttempts || 0) === 0);
-  const retries = poolToPartition.filter((l) => (l.callAttempts || 0) > 0);
-  const orderedPool: LeadRecord[] = [];
-  let idxU = 0;
-  let idxR = 0;
-  while (idxU < untouched.length || idxR < retries.length) {
-    for (let k = 0; k < 3 && idxU < untouched.length; k++) {
-      orderedPool.push(untouched[idxU++]);
-    }
-    if (idxR < retries.length) {
-      orderedPool.push(retries[idxR++]);
-    }
-  }
+  // Requirement 2: Tail-End Batch Sequencing for Re-Entry Leads
+  // Priority 1 (Top of Batch): Untouched fresh leads (`status == 'FRESH'` and `callAttempts == 0`).
+  // Priority 2 (Bottom of Batch / Tail End): Cooled-down re-entry / retry leads (`DIDNT_RECEIVE` / `SWITCH_OFF` / `callAttempts > 0`).
+  const untouched = poolToPartition.filter((l) => isUntouchedPriority1LeadPure(l));
+  const retries = poolToPartition.filter((l) => !isUntouchedPriority1LeadPure(l));
+  const orderedPool: LeadRecord[] = [...untouched, ...retries];
 
   // Determine strictly bounded slot numbers within 1..safeRepCount (NEVER > safeRepCount)
   const usedInProgressNumbers = new Set(
@@ -443,12 +549,15 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
       { length: slotCount },
       () => []
     );
-    for (let i = 0; i < orderedPool.length; i++) {
-      extraSlices[i % slotCount].push(orderedPool[i]);
+    for (let i = 0; i < untouched.length; i++) {
+      extraSlices[i % slotCount].push(untouched[i]);
+    }
+    for (let i = 0; i < retries.length; i++) {
+      extraSlices[i % slotCount].push(retries[i]);
     }
     const leadToExistingBatch = new Map<string, DailyBatchDocument>();
     const updatedInProgress = inProgressTodayBatches.map((b, idx) => {
-      const addChunk = extraSlices[idx] || [];
+      const addChunk = sortBatchLeadsUntouchedFirstRetriesTailPure(extraSlices[idx] || []);
       if (addChunk.length === 0) return b;
       const addedIds = addChunk.map((l) => l.id);
       for (const l of addChunk) {
@@ -463,19 +572,21 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
       });
     });
 
-    const updatedLeads = workingLeads.map((lead) => {
-      const targetBatch = leadToExistingBatch.get(lead.id);
-      if (targetBatch) {
-        return {
-          ...lead,
-          assignedBatchId: targetBatch.batchId,
-          assignedRepEmail: targetBatch.claimedByEmail || null,
-          assignedRepName: targetBatch.claimedByName || null,
-          updatedAt: nowIso,
-        };
-      }
-      return lead;
-    });
+    const updatedLeads = sortBatchLeadsUntouchedFirstRetriesTailPure(
+      workingLeads.map((lead) => {
+        const targetBatch = leadToExistingBatch.get(lead.id);
+        if (targetBatch) {
+          return {
+            ...lead,
+            assignedBatchId: targetBatch.batchId,
+            assignedRepEmail: targetBatch.claimedByEmail || null,
+            assignedRepName: targetBatch.claimedByName || null,
+            updatedAt: nowIso,
+          };
+        }
+        return lead;
+      })
+    );
 
     return {
       batches: updatedInProgress,
@@ -497,15 +608,23 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
   const availableBatchNumbers = openSlotNumbers.slice(0, actualBatchCount);
   const batchSizePerRep = Math.ceil(orderedPool.length / actualBatchCount);
 
-  // Round-robin equal slice distribution across `actualBatchCount` batches (`1..N`)
+  // Round-robin equal slice distribution across `actualBatchCount` batches (`1..N`),
+  // dealing ALL Priority 1 untouched leads first (indices 0..~1687) and ALL Priority 2 cooled-down retry leads
+  // strictly at the tail end of each batch slice (indices ~1688..1698).
   const slices: LeadRecord[][] = Array.from({ length: actualBatchCount }, () => []);
-  for (let i = 0; i < orderedPool.length; i++) {
-    slices[i % actualBatchCount].push(orderedPool[i]);
+  for (let i = 0; i < untouched.length; i++) {
+    slices[i % actualBatchCount].push(untouched[i]);
+  }
+  for (let i = 0; i < retries.length; i++) {
+    slices[i % actualBatchCount].push(retries[i]);
   }
 
   const leadToNewBatchId = new Map<string, string>();
+  const batchSequenceOrder = new Map<string, number>();
+  let globalSeq = 0;
 
-  const newAvailableBatches: DailyBatchDocument[] = slices.map((chunk, idx) => {
+  const newAvailableBatches: DailyBatchDocument[] = slices.map((rawChunk, idx) => {
+    const chunk = sortBatchLeadsUntouchedFirstRetriesTailPure(rawChunk);
     const batchNumber = availableBatchNumbers[idx];
     const batchId = formatBatchId(todayDate, batchNumber);
     let untouchedInBatch = 0;
@@ -515,7 +634,8 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
     for (const l of chunk) {
       leadIds.push(l.id);
       leadToNewBatchId.set(l.id, batchId);
-      if ((l.callAttempts || 0) === 0) {
+      batchSequenceOrder.set(l.id, globalSeq++);
+      if (isUntouchedPriority1LeadPure(l)) {
         untouchedInBatch++;
       } else {
         retryInBatch++;
@@ -541,7 +661,7 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
     });
   });
 
-  const updatedLeads = workingLeads.map((lead) => {
+  const mappedUpdatedLeads = workingLeads.map((lead) => {
     const assignedId = leadToNewBatchId.get(lead.id);
     if (assignedId) {
       return {
@@ -553,6 +673,18 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
       };
     }
     return lead;
+  });
+
+  const updatedLeads = [...mappedUpdatedLeads].sort((a, b) => {
+    const pA = isUntouchedPriority1LeadPure(a) ? 0 : 1;
+    const pB = isUntouchedPriority1LeadPure(b) ? 0 : 1;
+    if (pA !== pB) return pA - pB;
+    const seqA = batchSequenceOrder.get(a.id);
+    const seqB = batchSequenceOrder.get(b.id);
+    if (seqA !== undefined && seqB !== undefined && seqA !== seqB) {
+      return seqA - seqB;
+    }
+    return 0;
   });
 
   const mergedTodayBatches = [...inProgressTodayBatches, ...newAvailableBatches].sort(
@@ -579,8 +711,8 @@ export function partitionFreshLeadsEquallyForActiveRepsPure(
  * 100% Hands-Free Atomic Daily Reset & Deterministic 1..N Batch Partitioning Engine:
  * - Maintains `doc(reachDb, 'system_meta', 'daily_state')` with `{ activeDate, isProcessing, lastResetAt }`.
  * - Triggered automatically on First Load of a new IST date AND via the 30-second live midnight IST watcher.
- * - Also detects and immediately cleans up any duplicate/extra batches (`batchNumber > N` or `CLOSED` batches for today).
- * - Guarantees deterministic batch IDs `BATCH_${todayDate}_01` .. `BATCH_${todayDate}_0N` (never creating #4/#5/#6 for 3 reps).
+ * - Queries `FRESH`, `DIDNT_RECEIVE`, and `SWITCH_OFF` leads so cooled-down retry leads are automatically
+ *   released into today's pool and placed strictly at the tail end of each rep's batch (`Batch #1` .. `Batch #N`).
  */
 export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
   todayDate: string = getTodayIstDateString(),
@@ -598,19 +730,39 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
   const dailyStateRef = doc(db, 'system_meta', 'daily_state');
 
   try {
-    const [dailyStateSnap, activeReps, batchesSnap, freshLeadsSnap] =
-      await Promise.all([
-        getDocFromServer(dailyStateRef).catch(() => getDoc(dailyStateRef)),
-        getActiveSalesReps().catch(() => []),
-        getDocsFromServer(collection(db, 'batches')).catch(() =>
-          getDocs(collection(db, 'batches'))
-        ),
-        getDocsFromServer(
-          query(collection(db, 'leads'), where('status', '==', 'FRESH'))
-        ).catch(() =>
-          getDocs(query(collection(db, 'leads'), where('status', '==', 'FRESH')))
-        ),
-      ]);
+    const [
+      dailyStateSnap,
+      activeReps,
+      batchesSnap,
+      freshLeadsSnap,
+      didntReceiveSnap,
+      switchOffSnap,
+    ] = await Promise.all([
+      getDocFromServer(dailyStateRef).catch(() => getDoc(dailyStateRef)),
+      getActiveSalesReps().catch(() => []),
+      getDocsFromServer(collection(db, 'batches')).catch(() =>
+        getDocs(collection(db, 'batches'))
+      ),
+      getDocsFromServer(
+        query(collection(db, 'leads'), where('status', '==', 'FRESH'))
+      ).catch(() =>
+        getDocs(query(collection(db, 'leads'), where('status', '==', 'FRESH')))
+      ),
+      getDocsFromServer(
+        query(collection(db, 'leads'), where('status', '==', 'DIDNT_RECEIVE'))
+      ).catch(() =>
+        getDocs(
+          query(collection(db, 'leads'), where('status', '==', 'DIDNT_RECEIVE'))
+        )
+      ),
+      getDocsFromServer(
+        query(collection(db, 'leads'), where('status', '==', 'SWITCH_OFF'))
+      ).catch(() =>
+        getDocs(
+          query(collection(db, 'leads'), where('status', '==', 'SWITCH_OFF'))
+        )
+      ),
+    ]);
 
     const activeRepCount = Math.max(1, activeReps.length || 3);
 
@@ -640,17 +792,23 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
     });
     const existingBatches = Array.from(batchMap.values());
 
-    const freshLeadMap = new Map<string, LeadRecord>();
-    freshLeadsSnap?.forEach((d) => {
-      const l = { id: d.id, ...(d.data() as Omit<LeadRecord, 'id'>) };
-      if (!isLegacyMockOrSyntheticLead(l)) {
-        freshLeadMap.set(l.id, l);
-      }
-    });
-    const freshLeads = Array.from(freshLeadMap.values());
+    const candidateLeadMap = new Map<string, LeadRecord>();
+    const collectSnap = (snap: typeof freshLeadsSnap) => {
+      snap?.forEach((d) => {
+        const l = { id: d.id, ...(d.data() as Omit<LeadRecord, 'id'>) };
+        if (!isLegacyMockOrSyntheticLead(l)) {
+          candidateLeadMap.set(l.id, l);
+        }
+      });
+    };
+    collectSnap(freshLeadsSnap);
+    collectSnap(didntReceiveSnap);
+    collectSnap(switchOffSnap);
+
+    const candidateLeads = Array.from(candidateLeadMap.values());
 
     const partitioned = partitionFreshLeadsEquallyForActiveRepsPure(
-      freshLeads,
+      candidateLeads,
       existingBatches,
       activeRepCount,
       todayDate,
@@ -697,12 +855,14 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
       await wb.commit();
     }
 
-    // 3. Commit updated/re-partitioned FRESH leads in 400-op chunks
-    const originalById = new Map(freshLeads.map((l) => [l.id, l]));
+    // 3. Commit updated/re-partitioned FRESH & revived retry leads in 400-op chunks
+    const originalById = new Map(candidateLeads.map((l) => [l.id, l]));
     const leadsToWrite = partitioned.updatedLeads.filter((l) => {
       const orig = originalById.get(l.id);
       if (!orig) return true;
       return (
+        orig.status !== l.status ||
+        orig.cooldownUntil !== l.cooldownUntil ||
         orig.assignedBatchId !== l.assignedBatchId ||
         orig.assignedRepEmail !== l.assignedRepEmail ||
         orig.assignedRepName !== l.assignedRepName
@@ -714,6 +874,9 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
       const wb = writeBatch(db);
       for (const lead of chunk) {
         wb.update(doc(db, 'leads', lead.id), {
+          status: lead.status,
+          callAttempts: lead.callAttempts ?? 0,
+          cooldownUntil: lead.cooldownUntil ?? null,
           assignedBatchId: lead.assignedBatchId ?? null,
           assignedRepEmail: lead.assignedRepEmail ?? null,
           assignedRepName: lead.assignedRepName ?? null,
@@ -782,7 +945,7 @@ export function generateStratifiedBatch(
 
     if (lead.callAttempts === 0) {
       bucketA.push(lead);
-    } else if (lead.didntReceiveCount > 0) {
+    } else if (lead.didntReceiveCount > 0 || lead.switchOffCount > 0) {
       const clearedCooldown =
         !lead.cooldownUntil || new Date(lead.cooldownUntil).getTime() <= now.getTime();
       if (clearedCooldown) {

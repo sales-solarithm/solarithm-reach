@@ -42,6 +42,7 @@ import {
   fetchDailyStatsFromFirestore,
 } from '@/lib/dailyStatsService';
 import { LeadRecord } from '@/lib/types';
+import { formatRepName } from '@/lib/utils';
 
 export interface OwnerAnalyticsViewProps {
   leads: LeadRecord[];
@@ -436,7 +437,7 @@ export function OwnerAnalyticsView({
                       >
                         <div className="min-w-0 pr-2">
                           <div className="font-medium text-slate-900 dark:text-white truncate">
-                            {rep.repName}
+                            {formatRepName(rep.repName)}
                           </div>
                           <div className="text-[10px] font-mono text-slate-500 truncate">
                             {rep.callsDialed} calls · {rep.interestedGenerated}{' '}
@@ -469,7 +470,7 @@ export function OwnerAnalyticsView({
               className="inline-flex items-center gap-2 px-3 py-1 rounded-lg bg-[#D4AF37]/15 border border-[#D4AF37]/40 text-xs text-amber-900 dark:text-[#D4AF37]"
             >
               <span>
-                Isolated: <strong>{isolatedRepMeta.repName}</strong> vs. Team Avg
+                Isolated: <strong>{formatRepName(isolatedRepMeta.repName)}</strong> vs. Team Avg
               </span>
               <button
                 type="button"
@@ -643,7 +644,7 @@ export function OwnerAnalyticsView({
                           />
                           <div>
                             <div className="font-semibold text-slate-900 dark:text-white flex items-center gap-1.5">
-                              <span>{row.repName}</span>
+                              <span>{formatRepName(row.repName)}</span>
                               {idx < 5 && report.scorecardRows.length > 5 && (
                                 <span className="text-[9px] font-mono uppercase px-1.5 py-0.2 rounded bg-amber-500/10 text-amber-600 dark:text-[#D4AF37]">
                                   Top 5

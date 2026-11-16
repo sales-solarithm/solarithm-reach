@@ -30,6 +30,7 @@ import { OwnerAnalyticsView } from '@/components/analytics/OwnerAnalyticsView';
 import { SalesRepAnalyticsView } from '@/components/analytics/SalesRepAnalyticsView';
 import { MetricCards } from '@/components/dashboard/MetricCards';
 import { WorkspaceNav } from '@/components/dashboard/WorkspaceNav';
+import { formatRepName } from '@/lib/utils';
 import {
   BatchRecord,
   InterestedSubFilter,
@@ -40,6 +41,7 @@ import {
 import {
   WorkspaceFilterTab,
   applyManualCompanyNameEditPure,
+  commitCallOutcomeAtomicToFirestore,
   fetchAllBatchesFromServerFirestore,
   fetchAllLeadsFromServerFirestore,
   filterAndSortWorkspaceTableLeadsPure,
@@ -471,7 +473,7 @@ export default function DashboardPage() {
     );
 
     showToast(
-      `Batch #${transition.updatedBatch.batchNumber || 1} claimed by ${rep.name.split(' (')[0]}`
+      `Batch #${transition.updatedBatch.batchNumber || 1} claimed by ${formatRepName(rep.name)}`
     );
   };
 
@@ -596,17 +598,8 @@ export default function DashboardPage() {
       return updatedTargetLead;
     });
 
-    updateLeadsState(nextLeads);
-    if (updatedTargetLead) {
-      void syncLeadsToFirestore([updatedTargetLead]);
-      void syncDailyStatsToFirestore(nextLeads).then((st) => setDailyStats(st));
-      void fetchOwnerMetricCountsFromServer().then((counts) => {
-        if (counts) setServerOwnerMetrics(counts);
-      });
-    }
-
+    let updatedBatchDoc: BatchRecord | null = null;
     if (claimedBatchToIncrement) {
-      let updatedBatchDoc: BatchRecord | null = null;
       const nextBatches = batches.map((b) => {
         if (b.batchId !== claimedBatchToIncrement) return b;
         const nextCompleted = (b.completedCallsCount || 0) + 1;
@@ -619,21 +612,26 @@ export default function DashboardPage() {
                   (b.completedCallsCount || 0)
               );
         const nextRemaining = Math.max(0, currentRemaining - 1);
-        const nextLeadIds = Array.isArray(b.leadIds)
-          ? b.leadIds.filter((id) => id !== leadId)
-          : b.leadIds;
         updatedBatchDoc = {
           ...b,
           completedCallsCount: nextCompleted,
           remainingLeads: nextRemaining,
-          leadIds: nextLeadIds,
         };
         return updatedBatchDoc;
       });
       updateBatchesState(nextBatches);
-      if (updatedBatchDoc) {
-        void persistDailyBatchToFirestore(updatedBatchDoc);
-      }
+    }
+
+    updateLeadsState(nextLeads);
+    if (updatedTargetLead) {
+      void commitCallOutcomeAtomicToFirestore({
+        updatedLead: updatedTargetLead,
+        updatedBatch: updatedBatchDoc,
+      });
+      void syncDailyStatsToFirestore(nextLeads).then((st) => setDailyStats(st));
+      void fetchOwnerMetricCountsFromServer().then((counts) => {
+        if (counts) setServerOwnerMetrics(counts);
+      });
     }
 
     if (loadNext) {
@@ -748,7 +746,11 @@ export default function DashboardPage() {
   };
 
   const ownerMetrics = useMemo(() => {
-    const computed = computeOwnerMetricStripPure(leads, authorizedUsers);
+    const computed = computeOwnerMetricStripPure(
+      leads,
+      authorizedUsers,
+      batches
+    );
     if (!serverOwnerMetrics) return computed;
     return {
       totalFreshPool: Math.max(
@@ -780,7 +782,7 @@ export default function DashboardPage() {
         serverOwnerMetrics.totalAllLeads ?? 0
       ),
     };
-  }, [leads, authorizedUsers, serverOwnerMetrics]);
+  }, [leads, authorizedUsers, batches, serverOwnerMetrics]);
 
   const salesMetrics = useMemo(
     () =>
@@ -791,6 +793,7 @@ export default function DashboardPage() {
             myCallsToday: 0,
             proposalsPendingFollowUp: 0,
             futureRequirementsDue: 0,
+            interestedCount: 0,
           },
     [leads, batches, user]
   );
@@ -879,6 +882,19 @@ export default function DashboardPage() {
     searchQuery,
   ]);
 
+  const toCallTodayCount = useMemo(() => {
+    if (!user) return 0;
+    return filterAndSortWorkspaceTableLeadsPure({
+      leads,
+      batches,
+      tab: 'TO_CALL_TODAY',
+      isOwner,
+      userEmail: user.email,
+      todayDate: todayIstDate,
+      selectedRepEmailFilter,
+    }).filteredLeads.length;
+  }, [leads, batches, isOwner, user, todayIstDate, selectedRepEmailFilter]);
+
   const displayedLeads = workspaceFilterResult.filteredLeads;
   const todayActiveBatches = workspaceFilterResult.todayActiveBatches;
   const repClaimedBatchId = workspaceFilterResult.repClaimedTodayBatch?.batchId || null;
@@ -889,7 +905,7 @@ export default function DashboardPage() {
     let isMounted = true;
     const runBoundedQuery = async () => {
       try {
-        if (statusFilter === 'FRESH') {
+        if (statusFilter === 'FRESH' || statusFilter === 'ALL_LEADS') {
           const targetBatchId = isOwner
             ? activeBatchIdFilter && activeBatchIdFilter !== 'ALL'
               ? activeBatchIdFilter
@@ -923,7 +939,11 @@ export default function DashboardPage() {
               return Array.from(map.values());
             });
           }
-        } else {
+        } else if (
+          statusFilter === 'PROPOSAL_SHARED' ||
+          statusFilter === 'FUTURE_REQUIREMENT' ||
+          statusFilter === 'INTERESTED'
+        ) {
           const q = query(
             collection(db, 'leads'),
             where('status', '==', statusFilter),
@@ -973,7 +993,7 @@ export default function DashboardPage() {
     for (const u of authorizedUsers) {
       const roleUpper = String(u.role || '').toUpperCase();
       if (roleUpper === 'SALES' || roleUpper === 'LEAD_SALES') {
-        map.set(u.email.toLowerCase().trim(), u.name.split(' (')[0].trim());
+        map.set(u.email.toLowerCase().trim(), formatRepName(u.name));
       }
     }
     for (const l of leads) {
@@ -982,7 +1002,7 @@ export default function DashboardPage() {
         if (!map.has(em)) {
           map.set(
             em,
-            (l.assignedRepName || l.assignedRepEmail).split(' (')[0].trim()
+            formatRepName(l.assignedRepName || l.assignedRepEmail)
           );
         }
       }
@@ -1002,9 +1022,14 @@ export default function DashboardPage() {
 
   const handleSelectMetricStatusFilter = useCallback((rawStatus: string) => {
     if (
+      rawStatus === 'TO_CALL_TODAY' ||
+      rawStatus === 'FRESH' ||
+      rawStatus === 'ALL_LEADS' ||
       rawStatus === 'PROPOSAL_SHARED' ||
       rawStatus === 'FUTURE_REQUIREMENT' ||
-      rawStatus === 'INTERESTED'
+      rawStatus === 'INTERESTED' ||
+      rawStatus === 'CALLS_DIALED_TODAY' ||
+      rawStatus === 'DEAD_CLOSED_OUT'
     ) {
       setStatusFilter(rawStatus);
     } else {
@@ -1113,6 +1138,7 @@ export default function DashboardPage() {
               isOwner={isOwner}
               ownerMetrics={ownerMetrics}
               salesMetrics={salesMetrics}
+              activeStatusFilter={statusFilter}
               onSelectStatusFilter={handleSelectMetricStatusFilter}
             />
 
@@ -1125,7 +1151,7 @@ export default function DashboardPage() {
               activeBatchIdFilter={activeBatchIdFilter}
               onSelectActiveBatchWorkspace={(bId) => {
                 setActiveBatchIdFilter(bId);
-                if (bId) {
+                if (bId && statusFilter !== 'ALL_LEADS') {
                   setStatusFilter('FRESH');
                 }
               }}
@@ -1134,7 +1160,7 @@ export default function DashboardPage() {
               onSyncBatchesFromFirestore={handleSyncBatchesFromFirestore}
             />
 
-            {/* 3. Consolidated 4-Tab Bar + Batch/Rep Filters + 50-Row Paginated Lead Calling Table */}
+            {/* 3. Consolidated Priority & Status Filter Tabs + Batch/Rep Filters + 50-Row Paginated Lead Calling Table */}
             <section aria-label="Calling Queue Section" className="space-y-3">
               <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5 sm:gap-3">
                 {/* Horizontally Scrollable Consolidated Status Filter Tabs */}
@@ -1142,7 +1168,31 @@ export default function DashboardPage() {
                   data-testid="calling-status-filter-tabs"
                   className="flex items-center gap-2 overflow-x-auto scrollbar-none whitespace-nowrap pb-1 sm:pb-0 -mx-1 px-1"
                 >
-                  {/* Tab 1: Today's Batch / Fresh (Default active tab — replaces All Leads & Fresh) */}
+                  {/* Priority Tab 0 (Far Left): 🔥 To-Call Today (Follow-Ups & Expired Cooldown Retries) */}
+                  <button
+                    type="button"
+                    data-testid="tab-to-call-today"
+                    onClick={() => setStatusFilter('TO_CALL_TODAY')}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold border transition-colors shrink-0 cursor-pointer ${
+                      statusFilter === 'TO_CALL_TODAY'
+                        ? 'bg-amber-500 text-slate-950 border-amber-500'
+                        : 'bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/35 hover:bg-amber-500/20'
+                    }`}
+                  >
+                    <span>🔥 To-Call Today</span>
+                    <span
+                      data-testid="to-call-today-count-badge"
+                      className={`px-1.5 py-0.2 rounded text-[10px] font-mono tabular-nums ${
+                        statusFilter === 'TO_CALL_TODAY'
+                          ? 'bg-slate-950/20 text-slate-950'
+                          : 'bg-amber-500/20 text-amber-800 dark:text-amber-200'
+                      }`}
+                    >
+                      {toCallTodayCount}
+                    </span>
+                  </button>
+
+                  {/* Tab 1: Today's Batch / Fresh (Default active tab) */}
                   <button
                     type="button"
                     data-testid="tab-todays-batch-fresh"
@@ -1155,6 +1205,22 @@ export default function DashboardPage() {
                   >
                     Today&apos;s Batch / Fresh
                   </button>
+
+                  {/* Owner Master Lead Table Tab: All Leads & Attempt History */}
+                  {isOwner && (
+                    <button
+                      type="button"
+                      data-testid="tab-owner-all-leads"
+                      onClick={() => setStatusFilter('ALL_LEADS')}
+                      className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors shrink-0 cursor-pointer ${
+                        statusFilter === 'ALL_LEADS'
+                          ? 'bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-semibold'
+                          : 'bg-white dark:bg-[#11141B] border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400'
+                      }`}
+                    >
+                      All Leads &amp; Attempt History
+                    </button>
+                  )}
 
                   {/* Tab 2: Proposals Shared */}
                   <button
@@ -1184,7 +1250,7 @@ export default function DashboardPage() {
                     Future Requirement
                   </button>
 
-                  {/* Tab 4: Interested (Owner Queue) — Visible to Owner tier and as read-only handover status for Sales Reps */}
+                  {/* Tab 4: Interested (Owner Queue) */}
                   <button
                     type="button"
                     data-testid="owner-interested-filter-btn"
@@ -1197,11 +1263,40 @@ export default function DashboardPage() {
                   >
                     Interested (Owner Queue)
                   </button>
+
+                  {/* Tab 5: Calls Dialed Today */}
+                  <button
+                    type="button"
+                    data-testid="tab-calls-dialed-today"
+                    onClick={() => setStatusFilter('CALLS_DIALED_TODAY')}
+                    className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors shrink-0 cursor-pointer ${
+                      statusFilter === 'CALLS_DIALED_TODAY'
+                        ? 'bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-semibold'
+                        : 'bg-white dark:bg-[#11141B] border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400'
+                    }`}
+                  >
+                    Calls Dialed Today
+                  </button>
+
+                  {/* Tab 6: Dead / Closed Out */}
+                  <button
+                    type="button"
+                    data-testid="tab-dead-closed-out"
+                    onClick={() => setStatusFilter('DEAD_CLOSED_OUT')}
+                    className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors shrink-0 cursor-pointer ${
+                      statusFilter === 'DEAD_CLOSED_OUT'
+                        ? 'bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-semibold'
+                        : 'bg-white dark:bg-[#11141B] border border-slate-200 dark:border-white/10 text-slate-600 dark:text-slate-400'
+                    }`}
+                  >
+                    Dead / Closed Out
+                  </button>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2.5 w-full lg:w-auto justify-between lg:justify-end">
-                  {/* Owner Compact Batch Selector for Tab 1 (Today's Batch / Fresh) */}
-                  {isOwner && statusFilter === 'FRESH' && (
+                  {/* Owner Compact Batch Selector for Today's Batch / Fresh or All Leads & Attempt History */}
+                  {isOwner &&
+                    (statusFilter === 'FRESH' || statusFilter === 'ALL_LEADS') && (
                     <select
                       aria-label="Filter Today's Batches"
                       data-testid="owner-today-batch-filter"
@@ -1213,10 +1308,14 @@ export default function DashboardPage() {
                       }
                       className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-[#11141B] border border-slate-200 dark:border-white/10 text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-400 cursor-pointer"
                     >
-                      <option value="ALL">All Today&apos;s Batches</option>
+                      <option value="ALL">
+                        {statusFilter === 'ALL_LEADS'
+                          ? 'All Leads (All Batches & Pool)'
+                          : "All Today's Batches"}
+                      </option>
                       {todayActiveBatches.map((b) => {
                         const repLabel = b.claimedByName
-                          ? b.claimedByName.split(' (')[0].trim()
+                          ? formatRepName(b.claimedByName)
                           : 'Unclaimed';
                         return (
                           <option key={b.batchId} value={b.batchId}>
@@ -1227,7 +1326,7 @@ export default function DashboardPage() {
                     </select>
                   )}
 
-                  {/* Owner Compact Sales Rep Selector for Historical / Follow-up Tabs */}
+                  {/* Owner Compact Sales Rep Selector for Historical / Follow-up / Master Tabs */}
                   {isOwner && statusFilter !== 'FRESH' && (
                     <select
                       aria-label="Filter by Sales Rep"

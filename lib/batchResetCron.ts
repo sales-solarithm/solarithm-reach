@@ -168,7 +168,11 @@ export function runCooldownSweeperPure(
     if (lead.cooldownUntil) {
       const cooldownMs = new Date(lead.cooldownUntil).getTime();
       if (!Number.isNaN(cooldownMs) && cooldownMs <= nowMs) {
-        if (lead.status === 'FRESH' || lead.status === 'DIDNT_RECEIVE') {
+        if (
+          lead.status === 'FRESH' ||
+          lead.status === 'DIDNT_RECEIVE' ||
+          lead.status === 'SWITCH_OFF'
+        ) {
           cooldownClearedCount++;
           return {
             ...lead,

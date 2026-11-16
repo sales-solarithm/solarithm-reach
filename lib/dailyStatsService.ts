@@ -216,37 +216,9 @@ export function computeDailyStatsFromLeadsPure(
       }
     }
 
-    let engagedFromFreshYmd: string | null = null;
-    if (Array.isArray(lead.callHistory) && lead.callHistory.length > 0) {
-      const firstFresh = lead.callHistory.find(
-        (e) =>
-          (e.previousStatus === 'FRESH' || e.previousStatus === 'REVIVED_FRESH') &&
-          e.newStatus !== 'FRESH' &&
-          e.newStatus !== 'REVIVED_FRESH'
-      );
-      if (firstFresh && firstFresh.timestamp) {
-        const ymd = firstFresh.timestamp.slice(0, 10);
-        if (/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
-          engagedFromFreshYmd = ymd;
-        }
-      }
-    } else if (
-      isCalled &&
-      lead.status !== 'FRESH' &&
-      lead.status !== 'REVIVED_FRESH' &&
-      /^\d{4}-\d{2}-\d{2}$/.test(callDateYmd)
-    ) {
-      engagedFromFreshYmd = callDateYmd;
-    }
-
-    if (engagedFromFreshYmd) {
-      const b = ensureBucket(
-        engagedFromFreshYmd,
-        repIdentity.email,
-        repIdentity.name
-      );
-      b.newLeadsAdded += 1;
-    } else if (!lead.importBatchId && lead.createdByEmail && lead.createdAt) {
+    const isManualCreation =
+      lead.source === 'manual' || (!lead.importBatchId && Boolean(lead.createdByEmail));
+    if (isManualCreation && lead.createdByEmail && lead.createdAt) {
       const creatorIdentity = resolveCanonicalRepIdentity(
         lead.createdByEmail,
         lead.createdByName

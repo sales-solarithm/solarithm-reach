@@ -84,6 +84,7 @@ export interface LeadRecord {
   lastCalledByName?: string | null;
   lastCallNotes?: string | null;
   // Executive & Rep Performance Analytics Tracking Metadata
+  source?: 'manual' | 'excel' | null;
   createdByEmail?: string | null;
   createdByName?: string | null;
   createdByRole?: 'OWNER' | 'SALES' | null;

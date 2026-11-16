@@ -17,6 +17,7 @@ export interface SalesRepMetricStripData {
   myCallsToday: number;
   proposalsPendingFollowUp: number;
   futureRequirementsDue: number;
+  interestedCount?: number;
 }
 
 /**
@@ -32,7 +33,8 @@ import { getTodayIstDateString } from '@/types/batch';
 
 export function computeOwnerMetricStripPure(
   leads: LeadRecord[],
-  _authorizedUsers: AuthorizedUser[] = []
+  _authorizedUsers: AuthorizedUser[] = [],
+  batches: BatchRecord[] = []
 ): OwnerMetricStripData {
   let totalFreshPool = 0;
   let proposalsShared = 0;
@@ -75,6 +77,15 @@ export function computeOwnerMetricStripPure(
     }
   }
 
+  // Requirement 2: Prevent drift between batch completedCallsCount and global Calls Dialed Today
+  let batchCompletedCallsToday = 0;
+  for (const b of batches) {
+    if (b.date === todayIst || b.date === todayUtc) {
+      batchCompletedCallsToday += b.completedCallsCount || 0;
+    }
+  }
+  callsDialedToday = Math.max(callsDialedToday, batchCompletedCallsToday);
+
   return {
     totalFreshPool,
     proposalsShared,
@@ -86,11 +97,12 @@ export function computeOwnerMetricStripPure(
 }
 
 /**
- * Computes the 4 Zerodha Kite-style Status Metric Strip values for the Sales Rep view:
+ * Computes the Status Metric Strip values for the Sales Rep view:
  * 1. Batch Leads Remaining (Uncalled FRESH leads remaining in their claimed batch)
  * 2. My Calls Today (Total numbers dialed today)
  * 3. Proposals Pending Follow-up (Due within 48 hours)
- * 4. Future Requirements Due (Due this week)
+ * 4. Interested (Owner Queue) (Leads converted to Interested by this rep)
+ * 5. Future Requirements Due (Due this week)
  */
 export function computeSalesRepMetricStripPure(
   leads: LeadRecord[],
@@ -152,11 +164,21 @@ export function computeSalesRepMetricStripPure(
         areRepEmailsEquivalentPure(l.assignedRepEmail, normalizedEmail, l.assignedRepName))
   ).length;
 
+  const interestedCount = leads.filter(
+    (l) =>
+      l.status === 'INTERESTED' &&
+      (!l.assignedRepEmail ||
+        areRepEmailsEquivalentPure(l.assignedRepEmail, normalizedEmail, l.assignedRepName) ||
+        areRepEmailsEquivalentPure(l.escalatedByEmail, normalizedEmail, l.escalatedByName) ||
+        areRepEmailsEquivalentPure(l.lastCalledByEmail, normalizedEmail, l.lastCalledByName))
+  ).length;
+
   return {
     batchLeadsRemaining,
     myCallsToday,
     proposalsPendingFollowUp,
     futureRequirementsDue,
+    interestedCount,
   };
 }
 
