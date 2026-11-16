@@ -6,8 +6,10 @@ import {
   getCountFromServer,
   getDocs,
   getDocsFromServer,
+  increment,
   limit,
   query,
+  setDoc,
   startAfter,
   where,
   writeBatch,
@@ -214,7 +216,37 @@ export function computeDailyStatsFromLeadsPure(
       }
     }
 
-    if (!lead.importBatchId && lead.createdByEmail && lead.createdAt) {
+    let engagedFromFreshYmd: string | null = null;
+    if (Array.isArray(lead.callHistory) && lead.callHistory.length > 0) {
+      const firstFresh = lead.callHistory.find(
+        (e) =>
+          (e.previousStatus === 'FRESH' || e.previousStatus === 'REVIVED_FRESH') &&
+          e.newStatus !== 'FRESH' &&
+          e.newStatus !== 'REVIVED_FRESH'
+      );
+      if (firstFresh && firstFresh.timestamp) {
+        const ymd = firstFresh.timestamp.slice(0, 10);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+          engagedFromFreshYmd = ymd;
+        }
+      }
+    } else if (
+      isCalled &&
+      lead.status !== 'FRESH' &&
+      lead.status !== 'REVIVED_FRESH' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(callDateYmd)
+    ) {
+      engagedFromFreshYmd = callDateYmd;
+    }
+
+    if (engagedFromFreshYmd) {
+      const b = ensureBucket(
+        engagedFromFreshYmd,
+        repIdentity.email,
+        repIdentity.name
+      );
+      b.newLeadsAdded += 1;
+    } else if (!lead.importBatchId && lead.createdByEmail && lead.createdAt) {
       const creatorIdentity = resolveCanonicalRepIdentity(
         lead.createdByEmail,
         lead.createdByName
@@ -232,6 +264,50 @@ export function computeDailyStatsFromLeadsPure(
   }
 
   return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/**
+ * Module 5.2: Atomically increments `callsCount` and `newLeadsAdded` (`newLeads: increment(1)`)
+ * in `daily_stats/{date}_{repEmail}` when a sales rep engages a lead whose prior status was `FRESH`.
+ */
+export async function recordFirstFreshTransitionStatsInFirestore(params: {
+  dateYmd: string;
+  repEmail: string;
+  repName: string;
+  newStatus: string;
+}): Promise<void> {
+  if (!hasLiveReachFirebaseConfig()) return;
+  const resolved = resolveCanonicalRepIdentity(params.repEmail, params.repName);
+  const emailLower = (resolved?.email || params.repEmail || '').trim().toLowerCase();
+  if (!emailLower || !/^\d{4}-\d{2}-\d{2}$/.test(params.dateYmd)) return;
+  const cleanName = resolved?.name || String(params.repName || emailLower).split(' (')[0].trim();
+  const statId = `${params.dateYmd}_${emailLower}`;
+
+  try {
+    await setDoc(
+      doc(reachDb, 'daily_stats', statId),
+      {
+        id: statId,
+        date: params.dateYmd,
+        repEmail: emailLower,
+        repName: cleanName,
+        callsCount: increment(1),
+        newLeadsAdded: increment(1),
+        newLeads: increment(1),
+        proposalsCount:
+          params.newStatus === 'PROPOSAL_SHARED' ? increment(1) : increment(0),
+        interestedCount:
+          params.newStatus === 'INTERESTED' || params.newStatus === 'CLOSED_WON'
+            ? increment(1)
+            : increment(0),
+        wonCount: params.newStatus === 'CLOSED_WON' ? increment(1) : increment(0),
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+  } catch (err) {
+    reportCloudSyncError(err, 'recordFirstFreshTransitionStatsInFirestore');
+  }
 }
 
 export function mergeDailyStatsRecordsPure(

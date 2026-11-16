@@ -1462,7 +1462,7 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
       'hastisavani.07@solarithmdesign.com'
     );
 
-    // 3. Same-day follow-up note edit on calledLead1 -> must NOT increment callAttempts a second time on the same day
+    // 3. Same-day and next-day follow-up note edits on calledLead1 -> must NOT increment callAttempts a second time
     const followUpEditedLead1 = applyCallDispositionUpdatePure(calledLead1, {
       newStatus: 'PROPOSAL_SHARED',
       callDate: todayDate,
@@ -1471,5 +1471,41 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
       nowIso: '2026-11-15T05:30:00.000Z',
     });
     assert.equal(followUpEditedLead1.callAttempts, 1);
+
+    const nextDayFollowUpLead1 = applyCallDispositionUpdatePure(followUpEditedLead1, {
+      newStatus: 'PROPOSAL_SHARED',
+      callDate: '2026-11-16',
+      notes: 'Second follow-up check-in.',
+      actorUser: repActor,
+      nowIso: '2026-11-16T06:00:00.000Z',
+    });
+    assert.equal(nextDayFollowUpLead1.callAttempts, 1);
+
+    // 4. Verify Module 5.2 Scorecard NEW LEADS Metric increments whenever a sales rep engages a lead whose prior status was FRESH
+    const ownerScorecardReport = computeOwnerAnalyticsPure(
+      [nextDayFollowUpLead1, ownerUpdatedLead2],
+      [
+        {
+          employeeId: 'SOL-HS-001',
+          name: 'Savani Hasti Vijaybhai',
+          email: 'hastisavani.07@solarithmdesign.com',
+          officialEmail: 'hastisavani.07@solarithmdesign.com',
+          role: 'SALES',
+          department: 'Sales',
+          designation: 'Lead Sales',
+          status: 'ACTIVE',
+        },
+      ],
+      { preset: 'ALL_TIME' },
+      '2026-11-16T08:00:00.000Z'
+    );
+    const hastiScorecard = ownerScorecardReport.scorecardRows.find(
+      (r) => r.repEmail === 'hastisavani.07@solarithmdesign.com'
+    );
+    assert.ok(hastiScorecard);
+    assert.equal(hastiScorecard.callsDialed, 2);
+    assert.equal(hastiScorecard.newLeadsAdded, 2); // Both Lead #1 and Lead #2 were engaged from FRESH by Hasti
+    assert.equal(hastiScorecard.proposalsShared, 1);
+    assert.equal(hastiScorecard.interestedGenerated, 1);
   });
 });

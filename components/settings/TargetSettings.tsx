@@ -94,6 +94,33 @@ export function computeRepTodayCallsFromLeads(
   let sessionCallsToday = 0;
 
   for (const lead of leads) {
+    if (lead.status === 'FRESH' || lead.status === 'REVIVED_FRESH') {
+      continue;
+    }
+
+    if (Array.isArray(lead.callHistory) && lead.callHistory.length > 0) {
+      const firstFreshTransition = lead.callHistory.find(
+        (entry) =>
+          (entry.previousStatus === 'FRESH' ||
+            entry.previousStatus === 'REVIVED_FRESH') &&
+          entry.newStatus !== 'FRESH' &&
+          entry.newStatus !== 'REVIVED_FRESH'
+      );
+      if (firstFreshTransition) {
+        const entryByRep =
+          firstFreshTransition.repEmail?.toLowerCase().trim() === normalizedEmail ||
+          lead.assignedRepEmail?.toLowerCase().trim() === normalizedEmail;
+        if (
+          entryByRep &&
+          firstFreshTransition.timestamp &&
+          firstFreshTransition.timestamp.startsWith(todayPrefix)
+        ) {
+          sessionCallsToday += 1;
+        }
+        continue;
+      }
+    }
+
     const calledByRep =
       lead.lastCalledByEmail?.toLowerCase().trim() === normalizedEmail ||
       lead.assignedRepEmail?.toLowerCase().trim() === normalizedEmail;

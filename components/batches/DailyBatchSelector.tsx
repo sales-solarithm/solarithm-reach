@@ -577,7 +577,9 @@ export function DailyBatchSelector({
                         >
                           <Lock className="w-3.5 h-3.5 text-[#E5B842]" />
                           <span>
-                            {claimingBatchId === batch.batchId ? 'Claiming...' : 'Claim Batch'}
+                            {claimingBatchId === batch.batchId
+                              ? 'Claiming...'
+                              : 'Claim Batch for Myself'}
                           </span>
                         </button>
                       </div>

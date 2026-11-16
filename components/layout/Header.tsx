@@ -82,10 +82,10 @@ export function Header({
   );
 
   useEffect(() => {
-    setMounted(true);
     let active = true;
     void verifyReachCloudConnectionFromServer().then((res) => {
       if (active) {
+        setMounted(true);
         setCloudDbConnected(res.connected);
       }
     });

@@ -146,8 +146,8 @@ describe('Executive & Rep Performance Analytics Engine (Zerodha Console Style)',
     // Originating Sales Rep attribution MUST remain Hasti so Hasti gets credit in "Interested Converted to Clients"
     assert.equal(closedWonLead.assignedRepEmail, 'hastisavani.07@solarithmdesign.com');
     assert.equal(closedWonLead.assignedRepName, 'Savani Hasti Vijaybhai');
-    assert.equal(closedWonLead.lastCalledByEmail, 'jayshah.03@solarithmdesign.com');
-    assert.equal(closedWonLead.lastCalledByName, 'Jay Jalpa');
+    assert.equal(closedWonLead.lastCalledByEmail, 'hastisavani.07@solarithmdesign.com');
+    assert.equal(closedWonLead.lastCalledByName, 'Savani Hasti Vijaybhai');
   });
 
   it('3. Owner Analytics & Sales Rep Personal Analytics compute accurate scorecards, funnels, and strictly isolated rep KPIs with zero mock numbers', () => {
@@ -253,7 +253,7 @@ describe('Executive & Rep Performance Analytics Engine (Zerodha Console Style)',
     );
     assert.ok(hastiRow);
     assert.equal(hastiRow.callsDialed, 3);
-    assert.equal(hastiRow.newLeadsAdded, 1);
+    assert.equal(hastiRow.newLeadsAdded, 3); // All 3 leads (h-1, h-2, h-3) were engaged from FRESH by Hasti
     assert.equal(hastiRow.proposalsShared, 1);
     assert.equal(hastiRow.interestedGenerated, 2); // h-2 (now CLOSED_WON) + h-3 (INTERESTED)
     assert.equal(hastiRow.convertedToClientsWon, 1); // h-2
@@ -283,7 +283,7 @@ describe('Executive & Rep Performance Analytics Engine (Zerodha Console Style)',
     assert.equal(hastiPersonal.kpiStrip.myCallsSelectedPeriod, 3);
     assert.equal(hastiPersonal.kpiStrip.myCallsToday, 1); // h-1 called on 2026-11-01 by Hasti
     assert.equal(hastiPersonal.kpiStrip.dailyTarget, 120);
-    assert.equal(hastiPersonal.kpiStrip.newLeadsAddedByMe, 1);
+    assert.equal(hastiPersonal.kpiStrip.newLeadsAddedByMe, 3);
     assert.equal(hastiPersonal.kpiStrip.proposalsShared, 1);
     assert.equal(hastiPersonal.kpiStrip.convertedToInterested, 2);
     assert.equal(hastiPersonal.kpiStrip.interestedConvertedToClients, 1);

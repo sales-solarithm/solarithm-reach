@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { X, Phone, MapPin, Clock, Flame, Pencil, Check } from 'lucide-react';
+import { X, Phone, MapPin, Clock, Flame, Pencil } from 'lucide-react';
 import {
   AuthorizedUser,
   LeadRecord,
@@ -110,6 +110,76 @@ export function paginateCallingLeadsPure(
     endIndex,
     totalCount,
   };
+}
+
+export interface LeadNoteHistoryTimelineItem {
+  id: string;
+  repName: string;
+  timestamp: string;
+  noteText: string;
+  statusLabel?: string;
+}
+
+export function buildLeadNotesActivityHistoryPure(
+  lead: LeadRecord | null | undefined
+): LeadNoteHistoryTimelineItem[] {
+  if (!lead) return [];
+  const items: LeadNoteHistoryTimelineItem[] = [];
+  const seenTexts = new Set<string>();
+
+  if (Array.isArray(lead.callHistory) && lead.callHistory.length > 0) {
+    const sorted = [...lead.callHistory].sort((a, b) =>
+      String(a.timestamp || '').localeCompare(String(b.timestamp || ''))
+    );
+    for (const entry of sorted) {
+      const cleaned = stripSystemIngestionNotePure(entry.note);
+      if (!cleaned) continue;
+      seenTexts.add(cleaned);
+      const repDisplay = String(
+        entry.repName || entry.repEmail || lead.lastCalledByName || lead.assignedRepName || 'Sales Rep'
+      )
+        .split(' (')[0]
+        .trim();
+      const rawTs = String(entry.timestamp || '');
+      const formattedTs = rawTs.includes('T')
+        ? rawTs.slice(0, 16).replace('T', ' ')
+        : rawTs.slice(0, 10) || 'Recorded';
+      items.push({
+        id: entry.id || `${rawTs}-${items.length}`,
+        repName: repDisplay,
+        timestamp: formattedTs,
+        noteText: cleaned,
+        statusLabel: entry.newStatus,
+      });
+    }
+  }
+
+  const legacyNotes = stripSystemIngestionNotePure(lead.notes);
+  if (legacyNotes && items.length === 0) {
+    const fallbackRep = String(
+      lead.lastCalledByName || lead.assignedRepName || 'Sales Rep'
+    )
+      .split(' (')[0]
+      .trim();
+    const fallbackTs = String(
+      lead.lastCalledDate || lead.updatedAt || lead.createdAt || ''
+    ).slice(0, 10);
+    const segments = legacyNotes
+      .split(/\s*\|\s*/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (let i = 0; i < segments.length; i += 1) {
+      if (seenTexts.has(segments[i])) continue;
+      items.push({
+        id: `legacy-note-${i}`,
+        repName: fallbackRep,
+        timestamp: fallbackTs || 'Recorded',
+        noteText: segments[i],
+      });
+    }
+  }
+
+  return items;
 }
 
 export function CallingTable({
@@ -570,8 +640,7 @@ export function CallingTable({
                         onClick={handleApplyCompanyNameOnly}
                         className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shrink-0 transition-colors cursor-pointer"
                       >
-                        <Check className="w-3.5 h-3.5" />
-                        <span>Apply</span>
+                        <span>✓ Apply</span>
                       </button>
                       <button
                         type="button"
@@ -816,16 +885,6 @@ export function CallingTable({
                     <option value="NOT_A_SOLAR_COMPANY">
                       Not a Solar Company (Moves to Dead / Closed Out)
                     </option>
-                    {isOwner && (
-                      <option value="CLOSED_WON">
-                        Closed Won (Converted to Paying Client)
-                      </option>
-                    )}
-                    {isOwner && (
-                      <option value="LEAD_LOST">
-                        Lead Lost (Closed Out by Owner)
-                      </option>
-                    )}
                   </select>
                 </div>
               )}
@@ -848,20 +907,41 @@ export function CallingTable({
                 />
               </div>
 
-              {/* Read-Only Historical Notes Timeline (if any past notes exist) */}
-              {stripSystemIngestionNotePure(selectedLead.notes) && (
-                <div
-                  data-testid="drawer-historical-notes-timeline"
-                  className="p-3 rounded-lg bg-slate-50 dark:bg-[#0B0D12] border border-slate-200 dark:border-white/10 space-y-1"
-                >
-                  <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                    Previous Call Notes (Read-Only)
+              {/* Scrollable Previous Notes & Activity History Timeline */}
+              {(() => {
+                const historyTimeline = buildLeadNotesActivityHistoryPure(selectedLead);
+                if (historyTimeline.length === 0) return null;
+                return (
+                  <div
+                    data-testid="drawer-historical-notes-timeline"
+                    className="p-3 rounded-lg bg-slate-50 dark:bg-[#0B0D12] border border-slate-200 dark:border-white/10 space-y-2"
+                  >
+                    <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                      <span>Previous Notes &amp; Activity History</span>
+                      <span className="font-mono">{historyTimeline.length}</span>
+                    </div>
+                    <div className="max-h-36 overflow-y-auto space-y-2 pr-1">
+                      {historyTimeline.map((entry) => (
+                        <div
+                          key={entry.id}
+                          data-testid="drawer-history-timeline-item"
+                          className="p-2 rounded bg-white dark:bg-[#11141B] border border-slate-200/70 dark:border-white/5 space-y-0.5"
+                        >
+                          <div className="flex items-center justify-between gap-2 text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                            <span className="font-semibold text-slate-700 dark:text-slate-200 truncate">
+                              {entry.repName}
+                            </span>
+                            <span className="shrink-0">{entry.timestamp}</span>
+                          </div>
+                          <div className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">
+                            {entry.noteText}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                  <div className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">
-                    {stripSystemIngestionNotePure(selectedLead.notes)}
-                  </div>
-                </div>
-              )}
+                );
+              })()}
 
               {/* 3. Notes (Always opens empty for current call discussion) */}
               <div>
