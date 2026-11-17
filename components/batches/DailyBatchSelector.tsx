@@ -40,6 +40,32 @@ interface DailyBatchSelectorProps {
   onSyncBatchesFromFirestore?: (remoteBatches: DailyBatchDocument[]) => void;
 }
 
+export function formatBatchClaimTimePure(
+  claimedAt: string | null | undefined
+): string | null {
+  if (!claimedAt) return null;
+  const parsed = new Date(claimedAt);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toLocaleTimeString('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
+export function formatBatchClaimStatusLabelPure(
+  batch: Pick<DailyBatchDocument, 'status' | 'claimedByName' | 'claimedAt'>
+): string {
+  if (batch.status === 'AVAILABLE' || !batch.claimedByName) {
+    return 'Available';
+  }
+  const repShortName = formatRepName(batch.claimedByName);
+  const timeStr = formatBatchClaimTimePure(batch.claimedAt);
+  return timeStr
+    ? `Claimed by ${repShortName} at ${timeStr}`
+    : `Claimed by ${repShortName}`;
+}
+
 export function DailyBatchSelector({
   currentUser,
   authorizedUsers = [],
@@ -395,7 +421,11 @@ export function DailyBatchSelector({
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-300">
               Batch ID: <span className="font-mono">{myActiveClaimedBatch.batchId}</span> · Locked by{' '}
-              <strong>{formatRepName(myActiveClaimedBatch.claimedByName)}</strong> · Completed Calls:{' '}
+              <strong>{formatRepName(myActiveClaimedBatch.claimedByName)}</strong>
+              {formatBatchClaimTimePure(myActiveClaimedBatch.claimedAt)
+                ? ` at ${formatBatchClaimTimePure(myActiveClaimedBatch.claimedAt)}`
+                : ''}{' '}
+              · Completed Calls:{' '}
               <strong className="font-mono tabular-nums">
                 {myActiveBatchDialedCount.toLocaleString()}
               </strong>{' '}
@@ -407,7 +437,9 @@ export function DailyBatchSelector({
             data-testid={`batch-status-badge-${myActiveClaimedBatch.batchNumber}`}
             className="px-2.5 py-1 rounded bg-[#E5B842]/15 border border-[#E5B842]/35 text-[11px] font-mono font-semibold text-[#9A7110] dark:text-[#E5B842] whitespace-nowrap self-start sm:self-center"
           >
-            Claimed by You
+            {formatBatchClaimTimePure(myActiveClaimedBatch.claimedAt)
+              ? `Claimed by You at ${formatBatchClaimTimePure(myActiveClaimedBatch.claimedAt)}`
+              : 'Claimed by You'}
           </span>
         </div>
       )}
@@ -437,9 +469,8 @@ export function DailyBatchSelector({
               const isClosed = batch.status === 'CLOSED';
               const totalLeadsCount = batch.totalLeads ?? batch.leadIds?.length ?? 0;
               const remainingFreshCount = getBatchRemainingFreshLeadsCount(batch);
-              const claimedRepShortName = batch.claimedByName
-                ? formatRepName(batch.claimedByName)
-                : 'Rep';
+              const claimedTimeLabel = formatBatchClaimTimePure(batch.claimedAt);
+              const claimedStatusLabel = formatBatchClaimStatusLabelPure(batch);
 
               return (
                 <div
@@ -485,7 +516,7 @@ export function DailyBatchSelector({
                         data-testid={`batch-status-badge-${batch.batchNumber}`}
                         className="px-2 py-0.5 rounded bg-[#E5B842]/15 border border-[#E5B842]/35 text-[11px] font-mono font-semibold text-[#9A7110] dark:text-[#E5B842] whitespace-nowrap"
                       >
-                        {`Claimed by ${claimedRepShortName}`}
+                        {claimedStatusLabel}
                       </span>
                     )}
                     {isClosed && (
@@ -594,6 +625,11 @@ export function DailyBatchSelector({
                             ? formatRepName(batch.claimedByName)
                             : 'Unclaimed'}
                         </strong>
+                        {claimedTimeLabel && (
+                          <span className="ml-1 font-mono text-[11px] text-slate-500 dark:text-slate-400">
+                            at {claimedTimeLabel}
+                          </span>
+                        )}
                         <span className="ml-2 font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
                           · {getBatchDialedCallsCount(batch).toLocaleString()} /{' '}
                           {totalLeadsCount.toLocaleString()} dialed

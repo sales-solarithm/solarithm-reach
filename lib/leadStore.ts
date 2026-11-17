@@ -4,6 +4,7 @@ import {
   getDoc,
   getDocs,
   getDocsFromServer,
+  increment,
   query,
   setDoc,
   where,
@@ -34,7 +35,12 @@ import {
   buildLeadRecordFromSanitizedRowPure,
   enrichSanitizedRowWithHistoricalFieldsPure,
 } from './historicalImportParser';
-import { areRepEmailsEquivalentPure } from './dailyStatsService';
+import {
+  areRepEmailsEquivalentPure,
+  resolveCanonicalRepIdentity,
+} from './dailyStatsService';
+import { doesLeadMatchWorkspaceDateFilterPure } from './dashboardMetrics';
+import type { AnalyticsDateFilter } from './performanceAnalytics';
 
 const STORAGE_KEYS = {
   LEADS: 'solarithm_reach_leads_v1',
@@ -1298,13 +1304,16 @@ export async function syncLeadsToFirestore(leadsToSync: LeadRecord[]): Promise<v
 }
 
 /**
- * Requirement 2: Fix Counter Drift (`completedCallsCount` vs `Calls Dialed Today`)
- * Atomically commits the updated `LeadRecord` and the updated `BatchRecord` (`completedCallsCount` & `remainingLeads`)
- * within the exact same Firestore `writeBatch` so batch counters and global daily call counts never drift.
+ * Requirement 1 & 2: Fast, Non-Blocking Atomic Call Outcome Persistence
+ * Atomically commits the updated `LeadRecord`, the updated `BatchRecord` (`completedCallsCount` & `remainingLeads`),
+ * and the rep's `daily_stats/{date}_{repEmail}` increment within the exact same Firestore `writeBatch`
+ * so drawer saves complete in a single lightweight network round-trip (<300ms) and counters never drift.
  */
 export async function commitCallOutcomeAtomicToFirestore(params: {
   updatedLead: LeadRecord;
   updatedBatch?: BatchRecord | null;
+  actorUser?: { email: string; name: string } | null;
+  isFirstTransitionFromFresh?: boolean;
 }): Promise<void> {
   if (!hasLiveReachFirebaseConfig()) return;
   try {
@@ -1320,6 +1329,51 @@ export async function commitCallOutcomeAtomicToFirestore(params: {
         sanitizeFirestorePayload(params.updatedBatch),
         { merge: true }
       );
+    }
+    if (params.actorUser && params.actorUser.email) {
+      const resolved = resolveCanonicalRepIdentity(
+        params.actorUser.email,
+        params.actorUser.name
+      );
+      const emailLower = (resolved?.email || params.actorUser.email)
+        .trim()
+        .toLowerCase();
+      const cleanName =
+        resolved?.name ||
+        String(params.actorUser.name || emailLower)
+          .split(' (')[0]
+          .trim();
+      const dateYmd = (
+        params.updatedLead.lastCalledDate ||
+        params.updatedLead.updatedAt ||
+        new Date().toISOString()
+      ).slice(0, 10);
+
+      if (emailLower && /^\d{4}-\d{2}-\d{2}$/.test(dateYmd)) {
+        const statId = `${dateYmd}_${emailLower}`;
+        const newStatus = params.updatedLead.status;
+        wb.set(
+          doc(db, 'daily_stats', statId),
+          {
+            id: statId,
+            date: dateYmd,
+            repEmail: emailLower,
+            repName: cleanName,
+            callsCount: params.isFirstTransitionFromFresh
+              ? increment(1)
+              : increment(0),
+            proposalsCount:
+              newStatus === 'PROPOSAL_SHARED' ? increment(1) : increment(0),
+            interestedCount:
+              newStatus === 'INTERESTED' || newStatus === 'CLOSED_WON'
+                ? increment(1)
+                : increment(0),
+            wonCount: newStatus === 'CLOSED_WON' ? increment(1) : increment(0),
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      }
     }
     await wb.commit();
   } catch (err) {
@@ -1443,6 +1497,7 @@ export interface WorkspaceTableFilterParams {
   userEmail: string;
   todayDate: string;
   nowIso?: string;
+  dateFilter?: AnalyticsDateFilter | null;
   selectedBatchIdFilter?: string | null;
   selectedRepEmailFilter?: string | null;
   interestedSubFilter?: InterestedSubFilter;
@@ -1559,6 +1614,7 @@ export function filterAndSortWorkspaceTableLeadsPure(
     userEmail,
     todayDate,
     nowIso,
+    dateFilter = null,
     selectedBatchIdFilter = null,
     selectedRepEmailFilter = null,
     interestedSubFilter = 'ALL',
@@ -1684,6 +1740,14 @@ export function filterAndSortWorkspaceTableLeadsPure(
     const masterLeads = leads.filter((lead) => {
       if (!matchesSearchQueryOnLead(lead, q)) return false;
 
+      if (
+        dateFilter &&
+        dateFilter.preset !== 'ALL_TIME' &&
+        !doesLeadMatchWorkspaceDateFilterPure(lead, dateFilter, nowIso)
+      ) {
+        return false;
+      }
+
       if (batchFilterId) {
         const inSelectedBatch =
           lead.assignedBatchId === batchFilterId || batchLeadIdsSet.has(lead.id);
@@ -1731,17 +1795,25 @@ export function filterAndSortWorkspaceTableLeadsPure(
 
   // TAB: Calls Dialed Today (`CALLS_DIALED_TODAY` — Top Metric Card Inspector)
   if (tab === 'CALLS_DIALED_TODAY') {
-    const todayUtc = new Date().toISOString().slice(0, 10);
+    const todayUtc = new Date(nowIso || Date.now()).toISOString().slice(0, 10);
+    const isRangePreset =
+      dateFilter &&
+      dateFilter.preset !== 'TODAY' &&
+      dateFilter.preset !== 'ALL_TIME';
+
     const dialedTodayLeads = leads.filter((lead) => {
       if (lead.status === 'FRESH' || lead.status === 'REVIVED_FRESH') return false;
       if (!matchesSearchQueryOnLead(lead, q)) return false;
 
-      const calledToday = Boolean(
-        lead.lastCalledDate &&
-          (lead.lastCalledDate.startsWith(todayDate) ||
-            lead.lastCalledDate.startsWith(todayUtc))
-      );
-      if (!calledToday) return false;
+      const matchesDate = isRangePreset
+        ? Boolean(lead.lastCalledDate) &&
+          doesLeadMatchWorkspaceDateFilterPure(lead, dateFilter, nowIso)
+        : Boolean(
+            lead.lastCalledDate &&
+              (lead.lastCalledDate.startsWith(todayDate) ||
+                lead.lastCalledDate.startsWith(todayUtc))
+          );
+      if (!matchesDate) return false;
 
       if (!isOwner) {
         return areRepEmailsEquivalentPure(
@@ -1779,6 +1851,9 @@ export function filterAndSortWorkspaceTableLeadsPure(
     const deadLeads = leads.filter((lead) => {
       if (!DEAD_CLOSED_STATUSES_SET.has(lead.status)) return false;
       if (!matchesSearchQueryOnLead(lead, q)) return false;
+      if (!doesLeadMatchWorkspaceDateFilterPure(lead, dateFilter, nowIso)) {
+        return false;
+      }
 
       if (!isOwner) {
         return areRepEmailsEquivalentPure(
@@ -1906,6 +1981,9 @@ export function filterAndSortWorkspaceTableLeadsPure(
   if (tab === 'PROPOSAL_SHARED' || tab === 'FUTURE_REQUIREMENT') {
     const matching = leads.filter((lead) => {
       if (lead.status !== tab) return false;
+      if (!doesLeadMatchWorkspaceDateFilterPure(lead, dateFilter, nowIso)) {
+        return false;
+      }
 
       if (!isOwner) {
         if (
@@ -1953,6 +2031,9 @@ export function filterAndSortWorkspaceTableLeadsPure(
   // TAB 4: Interested (Owner Queue) (`INTERESTED`)
   const interestedLeads = leads.filter((lead) => {
     if (lead.status !== 'INTERESTED') return false;
+    if (!doesLeadMatchWorkspaceDateFilterPure(lead, dateFilter, nowIso)) {
+      return false;
+    }
 
     if (!doesLeadMatchInterestedSubFilterPure(lead, interestedSubFilter)) {
       return false;

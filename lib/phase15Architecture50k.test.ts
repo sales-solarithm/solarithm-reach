@@ -41,7 +41,12 @@ import {
 import {
   computeOwnerMetricStripPure,
   computeSalesRepMetricStripPure,
+  doesLeadMatchWorkspaceDateFilterPure,
 } from './dashboardMetrics';
+import {
+  formatBatchClaimStatusLabelPure,
+  formatBatchClaimTimePure,
+} from '../components/batches/DailyBatchSelector';
 import { getTodayIstDateString } from '../types/batch';
 import { CANONICAL_NEXUS_EMPLOYEES } from './authService';
 import { BatchRecord, LeadRecord, SanitizedRowItem } from './types';
@@ -1898,5 +1903,142 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
 
     const salesStrip = computeSalesRepMetricStripPure([interestedLead], [], repEmail);
     assert.equal(salesStrip.interestedCount, 1);
+  });
+
+  it('30. Master Fix Spec: Batch Claim Timestamps ("Claimed by [Rep Name] at [HH:MM AM/PM]") and Workspace Date Range Filters (Today, Last 7 Days, This Month, Last 30 Days, All Time) across Metric Cards & Tables', () => {
+    const claimedIso = '2026-11-17T04:15:00.000Z';
+    const expectedTime = formatBatchClaimTimePure(claimedIso);
+    assert.ok(expectedTime, 'Expected formatted time string from ISO timestamp');
+
+    const claimedLabel = formatBatchClaimStatusLabelPure({
+      status: 'IN_PROGRESS',
+      claimedByName: 'Savani Hasti Vijaybhai',
+      claimedAt: claimedIso,
+    });
+    assert.equal(claimedLabel, `Claimed by Savani Hasti at ${expectedTime}`);
+
+    const availableLabel = formatBatchClaimStatusLabelPure({
+      status: 'AVAILABLE',
+      claimedByName: null,
+      claimedAt: null,
+    });
+    assert.equal(availableLabel, 'Available');
+
+    const repEmail = 'hastisavani.07@solarithmdesign.com';
+    const nowIso = '2026-11-17T10:00:00.000Z';
+    const todayDate = getTodayIstDateString(new Date(nowIso));
+
+    const leadTodayProposal: LeadRecord = {
+      ...makeFreshLead(4001),
+      id: 'lead-today-prop',
+      status: 'PROPOSAL_SHARED',
+      assignedRepEmail: repEmail,
+      lastCalledByEmail: repEmail,
+      lastCalledDate: `${todayDate}T08:00:00.000Z`,
+      updatedAt: `${todayDate}T08:00:00.000Z`,
+    };
+
+    const lead5DaysAgoInterested: LeadRecord = {
+      ...makeFreshLead(4002),
+      id: 'lead-5d-int',
+      status: 'INTERESTED',
+      assignedRepEmail: repEmail,
+      lastCalledByEmail: repEmail,
+      lastCalledDate: '2026-11-13T08:00:00.000Z',
+      updatedAt: '2026-11-13T08:00:00.000Z',
+    };
+
+    const lead45DaysAgoDead: LeadRecord = {
+      ...makeFreshLead(4003),
+      id: 'lead-45d-dead',
+      status: 'NOT_INTERESTED',
+      assignedRepEmail: repEmail,
+      lastCalledByEmail: repEmail,
+      lastCalledDate: '2026-09-20T08:00:00.000Z',
+      updatedAt: '2026-09-20T08:00:00.000Z',
+    };
+
+    const samplePool = [
+      leadTodayProposal,
+      lead5DaysAgoInterested,
+      lead45DaysAgoDead,
+    ];
+
+    // TODAY filter: matches only today's lead
+    assert.equal(
+      doesLeadMatchWorkspaceDateFilterPure(
+        leadTodayProposal,
+        { preset: 'TODAY' },
+        nowIso
+      ),
+      true
+    );
+    assert.equal(
+      doesLeadMatchWorkspaceDateFilterPure(
+        lead5DaysAgoInterested,
+        { preset: 'TODAY' },
+        nowIso
+      ),
+      false
+    );
+
+    const ownerToday = computeOwnerMetricStripPure(
+      samplePool,
+      [],
+      [],
+      { preset: 'TODAY' },
+      nowIso
+    );
+    assert.equal(ownerToday.proposalsShared, 1);
+    assert.equal(ownerToday.interestedOwnerQueue, 0);
+    assert.equal(ownerToday.deadClosedOut, 0);
+
+    // LAST_7_DAYS filter: includes today + 5 days ago, excludes 45 days ago
+    const ownerLast7 = computeOwnerMetricStripPure(
+      samplePool,
+      [],
+      [],
+      { preset: 'LAST_7_DAYS' },
+      nowIso
+    );
+    assert.equal(ownerLast7.proposalsShared, 1);
+    assert.equal(ownerLast7.interestedOwnerQueue, 1);
+    assert.equal(ownerLast7.deadClosedOut, 0);
+
+    // ALL_TIME filter: includes all 3 leads
+    const ownerAllTime = computeOwnerMetricStripPure(
+      samplePool,
+      [],
+      [],
+      { preset: 'ALL_TIME' },
+      nowIso
+    );
+    assert.equal(ownerAllTime.proposalsShared, 1);
+    assert.equal(ownerAllTime.interestedOwnerQueue, 1);
+    assert.equal(ownerAllTime.deadClosedOut, 1);
+
+    // Table filtering with TODAY vs LAST_7_DAYS on INTERESTED tab
+    const tableInterestedToday = filterAndSortWorkspaceTableLeadsPure({
+      leads: samplePool,
+      batches: [],
+      tab: 'INTERESTED',
+      isOwner: true,
+      userEmail: repEmail,
+      todayDate,
+      dateFilter: { preset: 'TODAY' },
+    });
+    assert.equal(tableInterestedToday.filteredLeads.length, 0);
+
+    const tableInterested7Days = filterAndSortWorkspaceTableLeadsPure({
+      leads: samplePool,
+      batches: [],
+      tab: 'INTERESTED',
+      isOwner: true,
+      userEmail: repEmail,
+      todayDate,
+      dateFilter: { preset: 'LAST_7_DAYS' },
+    });
+    assert.equal(tableInterested7Days.filteredLeads.length, 1);
+    assert.equal(tableInterested7Days.filteredLeads[0].id, 'lead-5d-int');
   });
 });

@@ -120,7 +120,7 @@ export default function DashboardPage() {
     'OUTREACH' | 'ANALYTICS'
   >('OUTREACH');
   const [analyticsDatePreset, setAnalyticsDatePreset] =
-    useState<AnalyticsDatePreset>('LAST_30_DAYS');
+    useState<AnalyticsDatePreset>('ALL_TIME');
   const [customStartDate, setCustomStartDate] = useState<string>(() => {
     const d = new Date();
     d.setUTCDate(d.getUTCDate() - 29);
@@ -313,6 +313,11 @@ export default function DashboardPage() {
   // `completedCallsCount` (or earliest `batchNumber`, i.e., `Batch #1`) and resets extra batches (`Batch #2`) to `AVAILABLE`.
   useEffect(() => {
     const todayDate = getTodayIstDateString();
+    const inProgressToday = batches.filter(
+      (b) => b.date === todayDate && b.status === 'IN_PROGRESS' && b.claimedByEmail
+    );
+    if (inProgressToday.length <= 1) return;
+
     const sanitized = autoSanitizeDuplicateClaimedBatchesPure(
       batches,
       leads,
@@ -546,7 +551,7 @@ export default function DashboardPage() {
     }
   };
 
-  // Save Call Disposition & Load Next Lead from CallingTable Drawer
+  // Save Call Disposition & Load Next Lead from CallingTable Drawer (<300ms fast non-blocking atomic commit)
   const handleSaveCallUpdate = ({
     leadId,
     newStatus,
@@ -567,22 +572,46 @@ export default function DashboardPage() {
     if (!user) return;
     const nowIso = new Date().toISOString();
 
+    // Advance drawer immediately before state/network work so Save & Load Next completes in <300ms
+    const currentIdx = displayedLeads.findIndex((l) => l.id === leadId);
+    const nextCandidate =
+      loadNext && currentIdx >= 0 && currentIdx + 1 < displayedLeads.length
+        ? displayedLeads[currentIdx + 1]
+        : null;
+    setSelectedLead(loadNext ? nextCandidate : null);
+
     let updatedTargetLead: LeadRecord | null = null;
     let claimedBatchToIncrement: string | null = null;
+    let isFirstTransitionFromFresh = false;
 
     const nextLeads = leads.map((lead) => {
       if (lead.id !== leadId) return lead;
 
       const previousStatus = lead.status;
-      const isFirstTransitionFromFresh =
+      isFirstTransitionFromFresh =
         (previousStatus === 'FRESH' || previousStatus === 'REVIVED_FRESH') &&
         newStatus !== 'FRESH' &&
         newStatus !== 'REVIVED_FRESH' &&
         ownerSubStatus === undefined;
 
       // Increment Batch & Rep Daily Call Counters ONLY on First Transition Away from FRESH
-      if (isFirstTransitionFromFresh && lead.assignedBatchId) {
-        claimedBatchToIncrement = lead.assignedBatchId;
+      if (isFirstTransitionFromFresh) {
+        claimedBatchToIncrement =
+          lead.assignedBatchId ||
+          batches.find(
+            (b) =>
+              b.date === todayIstDate &&
+              b.status !== 'CLOSED' &&
+              (b.leadIds?.includes(leadId) ||
+                (!isOwner &&
+                  areRepEmailsEquivalentPure(
+                    b.claimedByEmail,
+                    user.email,
+                    b.claimedByName,
+                    user.name
+                  )))
+          )?.batchId ||
+          null;
       }
 
       updatedTargetLead = applyCallDispositionUpdatePure(lead, {
@@ -619,30 +648,18 @@ export default function DashboardPage() {
         };
         return updatedBatchDoc;
       });
-      updateBatchesState(nextBatches);
+      setBatches(nextBatches);
     }
 
-    updateLeadsState(nextLeads);
+    setLeads(nextLeads);
+
     if (updatedTargetLead) {
       void commitCallOutcomeAtomicToFirestore({
         updatedLead: updatedTargetLead,
         updatedBatch: updatedBatchDoc,
+        actorUser: user,
+        isFirstTransitionFromFresh,
       });
-      void syncDailyStatsToFirestore(nextLeads).then((st) => setDailyStats(st));
-      void fetchOwnerMetricCountsFromServer().then((counts) => {
-        if (counts) setServerOwnerMetrics(counts);
-      });
-    }
-
-    if (loadNext) {
-      const currentIdx = displayedLeads.findIndex((l) => l.id === leadId);
-      const nextCandidate =
-        currentIdx >= 0 && currentIdx + 1 < displayedLeads.length
-          ? displayedLeads[currentIdx + 1]
-          : null;
-      setSelectedLead(nextCandidate);
-    } else {
-      setSelectedLead(null);
     }
 
     showToast(`Saved disposition (${newStatus})`);
@@ -749,9 +766,16 @@ export default function DashboardPage() {
     const computed = computeOwnerMetricStripPure(
       leads,
       authorizedUsers,
-      batches
+      batches,
+      analyticsDateFilter
     );
-    if (!serverOwnerMetrics) return computed;
+    if (
+      leads.length > 0 ||
+      analyticsDatePreset !== 'ALL_TIME' ||
+      !serverOwnerMetrics
+    ) {
+      return computed;
+    }
     return {
       totalFreshPool: Math.max(
         computed.totalFreshPool,
@@ -782,12 +806,24 @@ export default function DashboardPage() {
         serverOwnerMetrics.totalAllLeads ?? 0
       ),
     };
-  }, [leads, authorizedUsers, batches, serverOwnerMetrics]);
+  }, [
+    leads,
+    authorizedUsers,
+    batches,
+    analyticsDateFilter,
+    analyticsDatePreset,
+    serverOwnerMetrics,
+  ]);
 
   const salesMetrics = useMemo(
     () =>
       user
-        ? computeSalesRepMetricStripPure(leads, batches, user.email)
+        ? computeSalesRepMetricStripPure(
+            leads,
+            batches,
+            user.email,
+            analyticsDateFilter
+          )
         : {
             batchLeadsRemaining: 0,
             myCallsToday: 0,
@@ -795,7 +831,7 @@ export default function DashboardPage() {
             futureRequirementsDue: 0,
             interestedCount: 0,
           },
-    [leads, batches, user]
+    [leads, batches, user, analyticsDateFilter]
   );
 
   const isOwner = Boolean(
@@ -868,6 +904,7 @@ export default function DashboardPage() {
       selectedRepEmailFilter,
       interestedSubFilter,
       searchQuery,
+      dateFilter: analyticsDateFilter,
     });
   }, [
     leads,
@@ -880,6 +917,7 @@ export default function DashboardPage() {
     selectedRepEmailFilter,
     interestedSubFilter,
     searchQuery,
+    analyticsDateFilter,
   ]);
 
   const toCallTodayCount = useMemo(() => {

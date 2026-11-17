@@ -174,7 +174,7 @@ export function Header({
               className="text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 hover:bg-slate-100 dark:bg-white/[0.04] dark:hover:bg-white/[0.08] text-slate-800 dark:text-slate-200 font-medium transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <span>+ Add Lead</span>
+              <span>Add Lead</span>
             </button>
           )}
 
