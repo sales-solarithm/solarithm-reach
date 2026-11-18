@@ -40,6 +40,7 @@ import {
   resolveCanonicalRepIdentity,
 } from './dailyStatsService';
 import { doesLeadMatchWorkspaceDateFilterPure } from './dashboardMetrics';
+import { formatRepName } from './utils';
 import type { AnalyticsDateFilter } from './performanceAnalytics';
 
 const STORAGE_KEYS = {
@@ -250,9 +251,18 @@ export async function fetchAllBatchesFromServerFirestore(): Promise<BatchRecord[
     );
     const list: BatchRecord[] = [];
     snap.forEach((d) => {
-      const record = d.data() as BatchRecord;
-      if (record && record.batchId && !isLegacyMockBatch(record)) {
-        list.push(record);
+      const raw = d.data() as BatchRecord;
+      if (raw && (raw.batchId || d.id) && !isLegacyMockBatch(raw)) {
+        list.push({
+          ...raw,
+          batchId: d.id || raw.batchId,
+          claimedByEmail:
+            raw.status === 'AVAILABLE' ? null : (raw.claimedByEmail ?? null),
+          claimedByName:
+            raw.status === 'AVAILABLE' ? null : (raw.claimedByName ?? null),
+          claimedAt:
+            raw.status === 'AVAILABLE' ? null : (raw.claimedAt ?? null),
+        });
       }
     });
     return list.sort((a, b) => a.batchNumber - b.batchNumber);
@@ -1304,13 +1314,110 @@ export async function syncLeadsToFirestore(leadsToSync: LeadRecord[]): Promise<v
 }
 
 /**
+ * Builds the explicit Firestore update payload for `doc(reachDb, 'leads', lead.id)`
+ * with atomic `increment(1)` counters and 48-hour `cooldownUntil` for `DIDNT_RECEIVE` and `SWITCH_OFF`.
+ */
+export function buildLeadCallStatusUpdatePayloadPure(params: {
+  existingLead?: Partial<LeadRecord> | null;
+  updatedLead: LeadRecord;
+  newStatus?: LeadStatus;
+  currentUser?: { email: string; name: string } | null;
+  nowIso?: string;
+}): Record<string, unknown> {
+  const nowIso =
+    params.nowIso || params.updatedLead.updatedAt || new Date().toISOString();
+  const nowMs = new Date(nowIso).getTime();
+  const baseMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
+  const effectiveStatus = params.updatedLead.status;
+  const rawNewStatus = params.newStatus || effectiveStatus;
+  const existing = params.existingLead || params.updatedLead;
+
+  const actorName =
+    params.currentUser?.name ||
+    params.updatedLead.lastCalledBy ||
+    params.updatedLead.lastCalledByName ||
+    params.updatedLead.assignedRepName ||
+    '';
+  const actorEmail = (
+    params.currentUser?.email ||
+    params.updatedLead.repEmail ||
+    params.updatedLead.lastCalledByEmail ||
+    params.updatedLead.assignedRepEmail ||
+    ''
+  )
+    .trim()
+    .toLowerCase();
+
+  const isCooldownStatus =
+    effectiveStatus === 'DIDNT_RECEIVE' || effectiveStatus === 'SWITCH_OFF';
+  const cooldownUntil = isCooldownStatus
+    ? params.updatedLead.cooldownUntil &&
+      new Date(params.updatedLead.cooldownUntil).getTime() > baseMs
+      ? params.updatedLead.cooldownUntil
+      : new Date(baseMs + 48 * 60 * 60 * 1000).toISOString()
+    : null;
+
+  const formattedRepShortName = actorName ? formatRepName(actorName) : '';
+
+  return {
+    ...sanitizeFirestorePayload(params.updatedLead),
+    status: effectiveStatus,
+    lastCalled: nowIso,
+    lastCalledDate: params.updatedLead.lastCalledDate || nowIso,
+    lastCalledBy: formattedRepShortName,
+    lastCalledByName:
+      params.updatedLead.lastCalledByName || actorName.split(' (')[0].trim(),
+    repEmail: actorEmail,
+    lastCalledByEmail: params.updatedLead.lastCalledByEmail || actorEmail,
+    callAttempts: increment(1),
+    didntReceiveCount:
+      rawNewStatus === 'DIDNT_RECEIVE'
+        ? increment(1)
+        : existing.didntReceiveCount || 0,
+    switchOffCount:
+      rawNewStatus === 'SWITCH_OFF'
+        ? increment(1)
+        : existing.switchOffCount || 0,
+    cooldownUntil,
+    updatedAt: nowIso,
+  };
+}
+
+/**
+ * Direct Firestore helper to persist a lead call status update (`doc(reachDb, 'leads', lead.id)`).
+ * Strictly awaits the Firestore write inside `try / catch`, reports errors via
+ * `reportCloudSyncError(err, 'Lead Status Update')`, and rethrows so the UI surfaces a red error toast.
+ */
+export async function updateLeadCallStatus(params: {
+  existingLead?: Partial<LeadRecord> | null;
+  updatedLead: LeadRecord;
+  newStatus?: LeadStatus;
+  currentUser: { email: string; name: string };
+  nowIso?: string;
+}): Promise<void> {
+  if (!hasLiveReachFirebaseConfig()) return;
+  try {
+    const payload = buildLeadCallStatusUpdatePayloadPure(params);
+    await setDoc(doc(db, 'leads', params.updatedLead.id), payload, {
+      merge: true,
+    });
+  } catch (err) {
+    reportCloudSyncError(err, 'Lead Status Update');
+    throw err;
+  }
+}
+
+/**
  * Requirement 1 & 2: Fast, Non-Blocking Atomic Call Outcome Persistence
- * Atomically commits the updated `LeadRecord`, the updated `BatchRecord` (`completedCallsCount` & `remainingLeads`),
- * and the rep's `daily_stats/{date}_{repEmail}` increment within the exact same Firestore `writeBatch`
- * so drawer saves complete in a single lightweight network round-trip (<300ms) and counters never drift.
+ * Atomically commits the updated `LeadRecord` (with explicit `increment(1)` counters and 48h `cooldownUntil`),
+ * the updated `BatchRecord` (`completedCallsCount` & `remainingLeads`),
+ * and the rep's `daily_stats/{date}_{repEmail}` increment within the exact same Firestore `writeBatch`.
+ * Strictly awaits `wb.commit()` inside `try / catch` and calls `reportCloudSyncError(err, 'Lead Status Update')` on failure.
  */
 export async function commitCallOutcomeAtomicToFirestore(params: {
   updatedLead: LeadRecord;
+  existingLead?: Partial<LeadRecord> | null;
+  rawSelectedStatus?: LeadStatus;
   updatedBatch?: BatchRecord | null;
   actorUser?: { email: string; name: string } | null;
   isFirstTransitionFromFresh?: boolean;
@@ -1318,11 +1425,16 @@ export async function commitCallOutcomeAtomicToFirestore(params: {
   if (!hasLiveReachFirebaseConfig()) return;
   try {
     const wb = writeBatch(db);
-    wb.set(
-      doc(db, 'leads', params.updatedLead.id),
-      sanitizeFirestorePayload(params.updatedLead),
-      { merge: true }
-    );
+    const leadPayload = buildLeadCallStatusUpdatePayloadPure({
+      existingLead: params.existingLead,
+      updatedLead: params.updatedLead,
+      newStatus: params.rawSelectedStatus || params.updatedLead.status,
+      currentUser: params.actorUser,
+      nowIso: params.updatedLead.updatedAt,
+    });
+    wb.set(doc(db, 'leads', params.updatedLead.id), leadPayload, {
+      merge: true,
+    });
     if (params.updatedBatch && params.updatedBatch.batchId) {
       wb.set(
         doc(db, 'batches', params.updatedBatch.batchId),
@@ -1377,7 +1489,7 @@ export async function commitCallOutcomeAtomicToFirestore(params: {
     }
     await wb.commit();
   } catch (err) {
-    reportCloudSyncError(err, 'commitCallOutcomeAtomicToFirestore');
+    reportCloudSyncError(err, 'Lead Status Update');
     throw err;
   }
 }

@@ -31,6 +31,8 @@ import {
   formatOwnerSubStatusBadgePure,
   mergeDuplicateLeadRecord,
 } from './leadStore';
+import { buildLeadCallStatusUpdatePayloadPure } from './leadService';
+import { releaseBatchMetadataOnlyPure } from './batchService';
 import {
   autoSanitizeDuplicateClaimedBatchesPure,
   claimBatchStateTransition,
@@ -2040,5 +2042,168 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
     });
     assert.equal(tableInterested7Days.filteredLeads.length, 1);
     assert.equal(tableInterested7Days.filteredLeads[0].id, 'lead-5d-int');
+  });
+
+  it('31. Critical Fix Spec: Explicit Call Update Payload (lastCalled, lastCalledBy, repEmail, increment(1), 48h cooldownUntil) and 48-Hour Cooldown Exclusion & Tail-End Re-Entry in Batch Generator', () => {
+    const nowIso = '2026-11-18T06:00:00.000Z';
+    const currentUser = {
+      email: 'hastisavani.07@solarithmdesign.com',
+      name: 'Savani Hasti Vijaybhai',
+    };
+
+    const existingLead: LeadRecord = {
+      ...makeFreshLead(5001),
+      id: 'lead-call-payload-1',
+      didntReceiveCount: 2,
+      switchOffCount: 1,
+    };
+
+    const updatedDrLead = applyCallDispositionUpdatePure(existingLead, {
+      newStatus: 'DIDNT_RECEIVE',
+      callDate: '2026-11-18',
+      notes: 'Ringing, no response',
+      actorUser: currentUser,
+      nowIso,
+    });
+
+    const drPayload = buildLeadCallStatusUpdatePayloadPure({
+      existingLead,
+      updatedLead: updatedDrLead,
+      newStatus: 'DIDNT_RECEIVE',
+      currentUser,
+      nowIso,
+    });
+
+    assert.equal(drPayload.status, 'DIDNT_RECEIVE');
+    assert.equal(drPayload.lastCalled, nowIso);
+    assert.equal(drPayload.lastCalledBy, 'Savani Hasti');
+    assert.equal(drPayload.repEmail, 'hastisavani.07@solarithmdesign.com');
+    assert.equal(
+      drPayload.cooldownUntil,
+      new Date(new Date(nowIso).getTime() + 48 * 60 * 60 * 1000).toISOString()
+    );
+    assert.equal(drPayload.updatedAt, nowIso);
+    // switchOffCount should preserve existing.switchOffCount (1) while callAttempts and didntReceiveCount use Firestore increment(1) FieldValue
+    assert.equal(drPayload.switchOffCount, 1);
+    assert.ok(drPayload.callAttempts && typeof drPayload.callAttempts === 'object');
+    assert.ok(
+      drPayload.didntReceiveCount &&
+        typeof drPayload.didntReceiveCount === 'object'
+    );
+
+    // Non-cooldown status (PROPOSAL_SHARED) sets cooldownUntil: null
+    const updatedPropLead = applyCallDispositionUpdatePure(existingLead, {
+      newStatus: 'PROPOSAL_SHARED',
+      callDate: '2026-11-18',
+      notes: 'Sent 50kW proposal',
+      actorUser: currentUser,
+      nowIso,
+    });
+    const propPayload = buildLeadCallStatusUpdatePayloadPure({
+      existingLead,
+      updatedLead: updatedPropLead,
+      newStatus: 'PROPOSAL_SHARED',
+      currentUser,
+      nowIso,
+    });
+    assert.equal(propPayload.status, 'PROPOSAL_SHARED');
+    assert.equal(propPayload.cooldownUntil, null);
+    assert.equal(propPayload.didntReceiveCount, 2);
+    assert.equal(propPayload.switchOffCount, 1);
+
+    // Requirement 2: Metadata-Only Batch Release (no lead loops)
+    const claimedBatchSample: BatchRecord = {
+      batchId: 'BATCH_2026_11_18_01',
+      batchNumber: 1,
+      date: '2026-11-18',
+      totalLeads: 1699,
+      remainingLeads: 1699,
+      claimedByEmail: 'hastisavani.07@solarithmdesign.com',
+      claimedByName: 'Savani Hasti Vijaybhai',
+      claimedAt: '2026-11-18T04:00:00.000Z',
+      status: 'IN_PROGRESS',
+      completedCallsCount: 0,
+      untouchedCount: 1688,
+      retryCount: 11,
+      leadIds: ['untouched-5010'],
+      createdAt: '2026-11-18T03:00:00.000Z',
+    };
+    const metaRelease = releaseBatchMetadataOnlyPure(
+      'BATCH_2026_11_18_01',
+      [claimedBatchSample],
+      nowIso
+    );
+    assert.ok(metaRelease.releasedBatch);
+    assert.equal(metaRelease.releasedBatch.status, 'AVAILABLE');
+    assert.equal(metaRelease.releasedBatch.claimedByEmail, null);
+    assert.equal(metaRelease.releasedBatch.claimedByName, null);
+    assert.equal(metaRelease.releasedBatch.claimedAt, null);
+
+    // Requirement 3: 48-Hour Cooldown Enforcement in Daily Batch Generator
+    // Suppose reset runs at 2026-11-18T06:00:00.000Z:
+    // - Lead A: Untouched FRESH lead
+    // - Lead B: DIDNT_RECEIVE called yesterday (2026-11-17T12:00:00.000Z) -> cooldownUntil is 2026-11-19T12:00:00.000Z (> nowIso, still cooling!)
+    // - Lead C: SWITCH_OFF called 50 hours ago (2026-11-16T04:00:00.000Z) -> cooldownUntil is 2026-11-18T04:00:00.000Z (<= nowIso, expired!)
+    const untouchedFresh: LeadRecord = {
+      ...makeFreshLead(5010),
+      id: 'untouched-5010',
+      status: 'FRESH',
+      callAttempts: 0,
+    };
+
+    const activeCooldownLeadB: LeadRecord = {
+      ...makeFreshLead(5011),
+      id: 'cooling-lead-b',
+      status: 'DIDNT_RECEIVE',
+      callAttempts: 1,
+      didntReceiveCount: 1,
+      lastCalledDate: '2026-11-17T12:00:00.000Z',
+      cooldownUntil: '2026-11-19T12:00:00.000Z', // > nowIso (active 48h cooldown)
+      assignedBatchId: 'BATCH_2026_11_17_01',
+    };
+
+    const expiredCooldownLeadC: LeadRecord = {
+      ...makeFreshLead(5012),
+      id: 'expired-cooldown-c',
+      status: 'SWITCH_OFF',
+      callAttempts: 2,
+      didntReceiveCount: 1,
+      switchOffCount: 1,
+      lastCalledDate: '2026-11-16T04:00:00.000Z',
+      cooldownUntil: '2026-11-18T04:00:00.000Z', // <= nowIso (48h cooldown expired)
+    };
+
+    const partitioned = partitionFreshLeadsEquallyForActiveRepsPure(
+      [activeCooldownLeadB, expiredCooldownLeadC, untouchedFresh],
+      [],
+      1,
+      '2026-11-18',
+      nowIso,
+      true
+    );
+
+    assert.equal(partitioned.todayBatches.length, 1);
+    const batch = partitioned.todayBatches[0];
+    // Only untouchedFresh and expiredCooldownLeadC should be in the batch (activeCooldownLeadB strictly excluded!)
+    assert.deepEqual(batch.leadIds, ['untouched-5010', 'expired-cooldown-c']);
+    assert.equal(batch.untouchedCount, 1);
+    assert.equal(batch.retryCount, 1);
+
+    const afterLeadB = partitioned.updatedLeads.find(
+      (l) => l.id === 'cooling-lead-b'
+    )!;
+    assert.equal(afterLeadB.status, 'DIDNT_RECEIVE');
+    assert.equal(afterLeadB.assignedBatchId, null);
+    assert.equal(afterLeadB.cooldownUntil, '2026-11-19T12:00:00.000Z');
+
+    const afterLeadC = partitioned.updatedLeads.find(
+      (l) => l.id === 'expired-cooldown-c'
+    )!;
+    assert.equal(afterLeadC.status, 'FRESH');
+    assert.equal(afterLeadC.cooldownUntil, null);
+    assert.equal(afterLeadC.callAttempts, 2);
+    assert.equal(afterLeadC.didntReceiveCount, 1);
+    assert.equal(afterLeadC.switchOffCount, 1);
+    assert.equal(afterLeadC.assignedBatchId, 'BATCH_2026_11_18_01');
   });
 });

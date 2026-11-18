@@ -27,6 +27,11 @@ export function sanitizeFirestorePayload<T>(obj: T): T {
       .filter((item) => item !== undefined) as unknown as T;
   }
 
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== null && proto !== Object.prototype) {
+    return obj;
+  }
+
   const cleaned: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
     if (value !== undefined) {

@@ -80,6 +80,9 @@ export interface LeadRecord {
   lastWhatsAppSentByEmail?: string | null;
   // Phase 14: Extended call telemetry fields
   callCount?: number;
+  lastCalled?: string | null;
+  lastCalledBy?: string | null;
+  repEmail?: string | null;
   lastCalledByEmail?: string | null;
   lastCalledByName?: string | null;
   lastCallNotes?: string | null;

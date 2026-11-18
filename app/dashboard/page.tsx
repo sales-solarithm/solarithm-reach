@@ -4,17 +4,21 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Search, X } from 'lucide-react';
 import {
   collection,
+  deleteField,
+  doc,
   getDocs,
   getDocsFromServer,
   limit,
   onSnapshot,
   query,
+  updateDoc,
   where,
 } from 'firebase/firestore';
 import {
   CloudSyncErrorEvent,
   clearCloudSyncError,
   reachDb as db,
+  reportCloudSyncError,
   subscribeToCloudSyncErrors,
 } from '@/lib/firebaseDual';
 import { useAuth } from '@/context/AuthContext';
@@ -63,7 +67,7 @@ import {
   executeFirestoreBatchRelease,
   persistDailyBatchesToFirestore,
   persistDailyBatchToFirestore,
-  releaseBatchClaimPure,
+  releaseBatchMetadataOnlyPure,
 } from '@/lib/batchResetCron';
 import {
   autoSweepStaleBatchesAndGenerateTodayBatchesFirestore,
@@ -152,6 +156,9 @@ export default function DashboardPage() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isExcelModalOpen, setIsExcelModalOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [errorToastMessage, setErrorToastMessage] = useState<string | null>(
+    null
+  );
   const [cloudSyncError, setCloudSyncError] =
     useState<CloudSyncErrorEvent | null>(null);
 
@@ -160,6 +167,13 @@ export default function DashboardPage() {
     setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
     }, 3500);
+  }, []);
+
+  const showErrorToast = useCallback((msg: string) => {
+    setErrorToastMessage(msg);
+    setTimeout(() => {
+      setErrorToastMessage((prev) => (prev === msg ? null : prev));
+    }, 6000);
   }, []);
 
   useEffect(() => {
@@ -270,7 +284,19 @@ export default function DashboardPage() {
         collection(db, 'batches'),
         (snap) => {
           const remoteBatches = snap.docs
-            .map((d) => d.data() as BatchRecord)
+            .map((d) => {
+              const raw = d.data() as BatchRecord;
+              return {
+                ...raw,
+                batchId: d.id || raw.batchId,
+                claimedByEmail:
+                  raw.status === 'AVAILABLE' ? null : (raw.claimedByEmail ?? null),
+                claimedByName:
+                  raw.status === 'AVAILABLE' ? null : (raw.claimedByName ?? null),
+                claimedAt:
+                  raw.status === 'AVAILABLE' ? null : (raw.claimedAt ?? null),
+              } as BatchRecord;
+            })
             .filter((b) => !isLegacyMockBatch(b))
             .sort((a, b) => a.batchNumber - b.batchNumber);
           setBatches(remoteBatches);
@@ -320,27 +346,24 @@ export default function DashboardPage() {
 
     const sanitized = autoSanitizeDuplicateClaimedBatchesPure(
       batches,
-      leads,
+      [],
       todayDate
     );
-    if (!sanitized.changed) return;
+    if (!sanitized.changed || sanitized.releasedBatches.length === 0) return;
 
-    updateBatchesState(sanitized.updatedBatches);
-    if (sanitized.unassignedLeads.length > 0) {
-      updateLeadsState(sanitized.updatedLeads);
-    }
-    if (sanitized.releasedBatches.length > 0) {
-      void persistDailyBatchesToFirestore(sanitized.releasedBatches);
-    }
-    if (sanitized.unassignedLeads.length > 0) {
-      void syncLeadsToFirestore(sanitized.unassignedLeads);
-    }
-  }, [batches, leads, updateBatchesState, updateLeadsState]);
+    void Promise.all(
+      sanitized.releasedBatches.map((rb) =>
+        executeFirestoreBatchRelease(rb.batchId)
+      )
+    )
+      .then(() => {
+        updateBatchesState(sanitized.updatedBatches);
+      })
+      .catch(() => {});
+  }, [batches, updateBatchesState]);
 
-  // Automatic New-Day Sweep, Duplicate/Extra Batch Cleanup & Equal 1..N Batch Division:
-  // Triggers whenever unassigned FRESH leads exist, OR prior-day uncalled FRESH leads/batches need sweeping,
-  // OR extra/duplicate/closed batches (`batchNumber > N` or `CLOSED`) exist for TODAY,
-  // OR 0 batches exist for TODAY while Fresh leads are present in the pool.
+  // Automatic Batch Generation when 0 active batches exist for TODAY while Fresh leads are present:
+  // Never overwrites or re-partitions when today already has active batches (`todayActiveBatchesCount > 0`).
   useEffect(() => {
     const todayDate = getTodayIstDateString();
     const repCountFromUsers = authorizedUsers.filter(
@@ -354,22 +377,6 @@ export default function DashboardPage() {
       activeSalesRepCount || repCountFromUsers || 3
     );
 
-    const hasUnassignedFresh = leads.some(
-      (l) => (l.status === 'FRESH' || l.status === 'REVIVED_FRESH') && !l.assignedBatchId
-    );
-    const hasStaleAssignedFresh = leads.some(
-      (l) =>
-        (l.status === 'FRESH' || l.status === 'REVIVED_FRESH') &&
-        Boolean(l.assignedBatchId) &&
-        !doesBatchBelongToTodayPure(l.assignedBatchId, todayDate, batches)
-    );
-    const hasStaleOrExtraBatch = batches.some(
-      (b) =>
-        b.date !== todayDate ||
-        b.status === 'CLOSED' ||
-        b.batchNumber > effectiveRepCount ||
-        b.batchNumber < 1
-    );
     const todayActiveBatchesCount = batches.filter(
       (b) => b.date === todayDate && b.status !== 'CLOSED'
     ).length;
@@ -377,12 +384,7 @@ export default function DashboardPage() {
       todayActiveBatchesCount === 0 &&
       leads.some((l) => l.status === 'FRESH' || l.status === 'REVIVED_FRESH');
 
-    if (
-      !hasUnassignedFresh &&
-      !hasStaleAssignedFresh &&
-      !hasStaleOrExtraBatch &&
-      !hasZeroTodayBatchesWithFreshPool
-    ) {
+    if (!hasZeroTodayBatchesWithFreshPool) {
       return;
     }
 
@@ -482,26 +484,44 @@ export default function DashboardPage() {
     );
   };
 
-  // Owner 1-Click Manual Release Batch Control
+  // Owner 1-Click Manual Release Batch Control — Strict Cloud-First Persistence with deleteField()
   const handleReleaseBatch = async (batchId: string) => {
-    const releasedResult = releaseBatchClaimPure(batchId, batches, leads);
-    if (!releasedResult.releasedBatch) return;
+    const nowIso = new Date().toISOString();
+    try {
+      // 1. Await the cloud write FIRST (do not update local React state until Firestore confirms)
+      await updateDoc(doc(db, 'batches', batchId), {
+        claimedByEmail: deleteField(),
+        claimedByName: deleteField(),
+        claimedAt: deleteField(),
+        status: 'AVAILABLE',
+        updatedAt: nowIso,
+      });
 
-    updateBatchesState(releasedResult.updatedBatches);
-    updateLeadsState(releasedResult.updatedLeads);
-    if (activeBatchIdFilter === batchId) {
-      setActiveBatchIdFilter(null);
+      // 2. Only update local UI/state AFTER the cloud confirms the write
+      const releasedResult = releaseBatchMetadataOnlyPure(
+        batchId,
+        batches,
+        nowIso
+      );
+      setBatches(releasedResult.updatedBatches);
+      if (activeBatchIdFilter === batchId) {
+        setActiveBatchIdFilter(null);
+      }
+
+      showToast(
+        `Batch #${releasedResult.releasedBatch?.batchNumber || ''} released back to Available`
+      );
+    } catch (error) {
+      // 3. Catch and display the exact reason it failed
+      reportCloudSyncError(error, 'Release Batch');
+      console.error('Release Batch Failed:', error);
+      const msg =
+        error instanceof Error
+          ? error.message
+          : 'Failed to release batch in Cloud Firestore.';
+      showErrorToast(`Release Batch Failed: ${msg}`);
+      throw error;
     }
-
-    await executeFirestoreBatchRelease(
-      batchId,
-      releasedResult.releasedBatch,
-      releasedResult.unassignedLeads.map((l) => l.id)
-    );
-
-    showToast(
-      `Batch #${releasedResult.releasedBatch.batchNumber} released back to Available`
-    );
   };
 
   // Owner "Wipe All Data" Testing Utility handler
@@ -580,6 +600,7 @@ export default function DashboardPage() {
         : null;
     setSelectedLead(loadNext ? nextCandidate : null);
 
+    let previousLeadSnapshot: LeadRecord | null = null;
     let updatedTargetLead: LeadRecord | null = null;
     let claimedBatchToIncrement: string | null = null;
     let isFirstTransitionFromFresh = false;
@@ -587,6 +608,7 @@ export default function DashboardPage() {
     const nextLeads = leads.map((lead) => {
       if (lead.id !== leadId) return lead;
 
+      previousLeadSnapshot = lead;
       const previousStatus = lead.status;
       isFirstTransitionFromFresh =
         (previousStatus === 'FRESH' || previousStatus === 'REVIVED_FRESH') &&
@@ -656,9 +678,17 @@ export default function DashboardPage() {
     if (updatedTargetLead) {
       void commitCallOutcomeAtomicToFirestore({
         updatedLead: updatedTargetLead,
+        existingLead: previousLeadSnapshot,
+        rawSelectedStatus: newStatus,
         updatedBatch: updatedBatchDoc,
         actorUser: user,
         isFirstTransitionFromFresh,
+      }).catch((err: unknown) => {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Firestore failed to save lead status update.';
+        showErrorToast(`Failed to save call update (${newStatus}): ${msg}`);
       });
     }
 
@@ -1122,6 +1152,25 @@ export default function DashboardPage() {
         >
           <CheckCircle2 className="w-3.5 h-3.5 text-amber-400 shrink-0" />
           <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {errorToastMessage && (
+        <div
+          role="alert"
+          data-testid="error-toast-banner"
+          className="fixed bottom-16 right-5 z-50 px-3.5 py-2.5 rounded-xl bg-red-600 border border-red-400 text-white text-xs font-semibold shadow-xl flex items-center gap-2"
+        >
+          <AlertTriangle className="w-4 h-4 text-white shrink-0" />
+          <span>{errorToastMessage}</span>
+          <button
+            type="button"
+            onClick={() => setErrorToastMessage(null)}
+            aria-label="Dismiss error toast"
+            className="ml-1 p-0.5 rounded hover:bg-red-700 text-white cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 

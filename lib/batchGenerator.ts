@@ -96,7 +96,10 @@ export function computeCooldownUntil(callDateIso: string, hours = COOLDOWN_HOURS
  * (`DIDNT_RECEIVE` >= 48 hours; `SWITCH_OFF` >= configured retry interval).
  */
 export function isLeadOnCooldown(
-  lead: Pick<LeadRecord, 'cooldownUntil' | 'status' | 'lastCalledDate'>,
+  lead: Pick<
+    LeadRecord,
+    'cooldownUntil' | 'status' | 'lastCalledDate' | 'lastCalled'
+  >,
   now: Date = new Date(),
   switchOffRetryHours: number = SWITCH_OFF_RETRY_HOURS
 ): boolean {
@@ -107,11 +110,12 @@ export function isLeadOnCooldown(
       return cooldownTime > nowMs;
     }
   }
+  const rawLastCalled = lead.lastCalledDate || lead.lastCalled || null;
   if (
     (lead.status === 'DIDNT_RECEIVE' || lead.status === 'SWITCH_OFF') &&
-    lead.lastCalledDate
+    rawLastCalled
   ) {
-    const calledMs = new Date(lead.lastCalledDate).getTime();
+    const calledMs = new Date(rawLastCalled).getTime();
     if (!Number.isNaN(calledMs)) {
       const requiredHours =
         lead.status === 'SWITCH_OFF'
@@ -235,16 +239,40 @@ export function autoSweepStaleBatchesAndReleaseLeadsPure(
 
   const nowDate = new Date(nowIso);
   const sweptLeads = allLeads.map((lead) => {
-    const calledDateYmd = lead.lastCalledDate ? lead.lastCalledDate.slice(0, 10) : null;
+    const rawLastCalled = lead.lastCalledDate || lead.lastCalled || null;
+    const calledDateYmd = rawLastCalled ? rawLastCalled.slice(0, 10) : null;
     const wasCalledToday = Boolean(calledDateYmd && calledDateYmd >= todayDate);
+    const hasExplicitExpiredCooldown =
+      Boolean(lead.cooldownUntil) &&
+      !Number.isNaN(new Date(lead.cooldownUntil!).getTime()) &&
+      new Date(lead.cooldownUntil!).getTime() <= nowDate.getTime();
 
-    // Retention During Current Day: Never release a lead that was dialed today
+    // Exclude Active Cooldown Leads from Fresh Pool Allocation:
+    // Any lead marked DIDNT_RECEIVE or SWITCH_OFF whose cooldownUntil > currentISOString
+    // remains in an inactive holding state with assignedBatchId = null until its 48-hour timer expires.
     if (
-      !wasCalledToday &&
+      (lead.status === 'DIDNT_RECEIVE' || lead.status === 'SWITCH_OFF') &&
+      isLeadOnCooldown(lead, nowDate, switchOffRetryHours)
+    ) {
+      if (lead.assignedBatchId !== null) {
+        return {
+          ...lead,
+          assignedBatchId: null,
+          updatedAt: nowIso,
+        };
+      }
+      return lead;
+    }
+
+    // Re-Entry After Cooldown Expiry:
+    // Once cooldownUntil <= currentISOString, make them eligible to be pulled back into the tail end
+    // of daily batch assignments with their attempt counters intact.
+    if (
+      (!wasCalledToday || hasExplicitExpiredCooldown) &&
       (lead.status === 'DIDNT_RECEIVE' || lead.status === 'SWITCH_OFF') &&
       (lead.didntReceiveCount || 0) < 10 &&
       (lead.switchOffCount || 0) < 3 &&
-      Boolean(lead.cooldownUntil || lead.lastCalledDate) &&
+      Boolean(lead.cooldownUntil || rawLastCalled) &&
       !isLeadOnCooldown(lead, nowDate, switchOffRetryHours)
     ) {
       const preservedAttempts = Math.max(
@@ -256,6 +284,8 @@ export function autoSweepStaleBatchesAndReleaseLeadsPure(
         ...lead,
         status: 'FRESH',
         callAttempts: preservedAttempts,
+        didntReceiveCount: lead.didntReceiveCount || 0,
+        switchOffCount: lead.switchOffCount || 0,
         cooldownUntil: null,
         assignedBatchId: null,
         assignedRepEmail: null,
@@ -770,8 +800,37 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
       ? (dailyStateSnap.data() as DailyStateMetaDocument)
       : loadLocalDailyStateMeta();
 
+    const batchMap = new Map<string, DailyBatchDocument>();
+    batchesSnap?.forEach((d) => {
+      const raw = d.data() as DailyBatchDocument;
+      if (raw && (raw.batchId || d.id) && !isLegacyMockBatch(raw)) {
+        const normalized: DailyBatchDocument = {
+          ...raw,
+          batchId: d.id || raw.batchId,
+          claimedByEmail:
+            raw.status === 'AVAILABLE' ? null : (raw.claimedByEmail ?? null),
+          claimedByName:
+            raw.status === 'AVAILABLE' ? null : (raw.claimedByName ?? null),
+          claimedAt:
+            raw.status === 'AVAILABLE' ? null : (raw.claimedAt ?? null),
+        };
+        batchMap.set(normalized.batchId, normalized);
+      }
+    });
+    const existingBatches = Array.from(batchMap.values());
+
+    const todayValidExisting = existingBatches
+      .filter(
+        (b) =>
+          b.date === todayDate &&
+          b.status !== 'CLOSED' &&
+          b.batchNumber >= 1
+      )
+      .sort((a, b) => a.batchNumber - b.batchNumber);
+
     const isNewIstDay =
-      !remoteDailyState || remoteDailyState.activeDate !== todayDate;
+      (!remoteDailyState || remoteDailyState.activeDate !== todayDate) &&
+      todayValidExisting.length === 0;
 
     // Prevent concurrent race if another tab is actively processing the reset within the last 10 seconds
     if (
@@ -782,15 +841,6 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
     ) {
       return null;
     }
-
-    const batchMap = new Map<string, DailyBatchDocument>();
-    batchesSnap?.forEach((d) => {
-      const b = d.data() as DailyBatchDocument;
-      if (b && b.batchId && !isLegacyMockBatch(b)) {
-        batchMap.set(b.batchId, b);
-      }
-    });
-    const existingBatches = Array.from(batchMap.values());
 
     const candidateLeadMap = new Map<string, LeadRecord>();
     const collectSnap = (snap: typeof freshLeadsSnap) => {
@@ -806,6 +856,18 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
     collectSnap(switchOffSnap);
 
     const candidateLeads = Array.from(candidateLeadMap.values());
+
+    // If today already has valid active batches (`todayValidExisting.length > 0`),
+    // preserve the live Firestore batches as-is so manual Release Batch / Claim changes never get overwritten on refresh.
+    if (!isNewIstDay && todayValidExisting.length > 0) {
+      return {
+        batches: todayValidExisting,
+        todayBatches: todayValidExisting,
+        freshLeads: candidateLeads,
+        activeRepCount,
+        changed: false,
+      };
+    }
 
     const partitioned = partitionFreshLeadsEquallyForActiveRepsPure(
       candidateLeads,
@@ -876,6 +938,8 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
         wb.update(doc(db, 'leads', lead.id), {
           status: lead.status,
           callAttempts: lead.callAttempts ?? 0,
+          didntReceiveCount: lead.didntReceiveCount ?? 0,
+          switchOffCount: lead.switchOffCount ?? 0,
           cooldownUntil: lead.cooldownUntil ?? null,
           assignedBatchId: lead.assignedBatchId ?? null,
           assignedRepEmail: lead.assignedRepEmail ?? null,

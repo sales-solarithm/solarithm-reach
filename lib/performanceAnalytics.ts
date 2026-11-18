@@ -634,11 +634,26 @@ export function applyCallDispositionUpdatePure(
       : Math.max(1, lead.callCount ?? lead.callAttempts ?? 1),
     didntReceiveCount: nextDidntReceive,
     switchOffCount: nextSwitchOff,
+    lastCalled: isOwnerPipelineUpdate
+      ? lead.lastCalled || lead.lastCalledDate || callDateIso
+      : wasFreshBeforeUpdate
+        ? callDateIso
+        : lead.lastCalledDate || callDateIso,
     lastCalledDate: isOwnerPipelineUpdate
       ? lead.lastCalledDate || callDateIso
       : wasFreshBeforeUpdate
         ? callDateIso
         : lead.lastCalledDate || callDateIso,
+    lastCalledBy: isOwnerPipelineUpdate
+      ? (lead.lastCalledBy || lead.lastCalledByName || preservedRepName)
+          .trim()
+          .split(/\s+/)
+          .slice(0, 2)
+          .join(' ')
+      : actorName.trim().split(/\s+/).slice(0, 2).join(' '),
+    repEmail: isOwnerPipelineUpdate
+      ? lead.repEmail || lead.lastCalledByEmail || preservedRepEmail
+      : actorEmail,
     lastCalledByEmail: isOwnerPipelineUpdate
       ? lead.lastCalledByEmail || preservedRepEmail
       : actorEmail,

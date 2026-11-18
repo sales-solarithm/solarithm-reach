@@ -1,14 +1,26 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { collection, onSnapshot, query, where } from 'firebase/firestore';
+import {
+  collection,
+  deleteField,
+  doc,
+  onSnapshot,
+  query,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
 import {
   Lock,
   PhoneOutgoing,
   ShieldAlert,
   UserCheck,
 } from 'lucide-react';
-import { hasLiveReachFirebaseConfig, reachDb as db } from '@/lib/firebaseDual';
+import {
+  hasLiveReachFirebaseConfig,
+  reachDb as db,
+  reportCloudSyncError,
+} from '@/lib/firebaseDual';
 import { AuthorizedUser, LeadRecord } from '@/lib/types';
 import {
   DailyBatchDocument,
@@ -153,8 +165,19 @@ export function DailyBatchSelector({
           if (!snapshot.empty && onSyncBatchesFromFirestore) {
             const remote: DailyBatchDocument[] = [];
             snapshot.forEach((docSnap) => {
-              const data = docSnap.data() as DailyBatchDocument;
-              if (data?.batchId) remote.push(data);
+              const raw = docSnap.data() as DailyBatchDocument;
+              if (raw && (raw.batchId || docSnap.id)) {
+                remote.push({
+                  ...raw,
+                  batchId: docSnap.id || raw.batchId,
+                  claimedByEmail:
+                    raw.status === 'AVAILABLE' ? null : (raw.claimedByEmail ?? null),
+                  claimedByName:
+                    raw.status === 'AVAILABLE' ? null : (raw.claimedByName ?? null),
+                  claimedAt:
+                    raw.status === 'AVAILABLE' ? null : (raw.claimedAt ?? null),
+                });
+              }
             });
             if (remote.length > 0) {
               onSyncBatchesFromFirestore(remote);
@@ -327,15 +350,31 @@ export function DailyBatchSelector({
     }
   };
 
-  const handleReleaseBatchClick = async (batchId: string) => {
-    if (!onReleaseBatch) return;
+  const handleReleaseBatch = async (batchId: string) => {
     setClaimError(null);
     setReleasingBatchId(batchId);
     try {
-      await onReleaseBatch(batchId);
-    } catch (err) {
+      if (onReleaseBatch) {
+        // Parent handler performs `await updateDoc(doc(reachDb, 'batches', batchId), { claimedByEmail: deleteField(), ... })`
+        // BEFORE updating any local React state (`setBatches`).
+        await onReleaseBatch(batchId);
+      } else if (hasLiveReachFirebaseConfig()) {
+        // 1. Await the cloud write FIRST
+        const batchRef = doc(db, 'batches', batchId);
+        await updateDoc(batchRef, {
+          claimedByEmail: deleteField(),
+          claimedByName: deleteField(),
+          claimedAt: deleteField(),
+          status: 'AVAILABLE',
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      // 3. Catch and display the exact reason it failed
+      reportCloudSyncError(error, 'Release Batch');
+      console.error('Release Batch Failed:', error);
       setClaimError(
-        err instanceof Error ? err.message : 'Unable to release batch.'
+        error instanceof Error ? error.message : 'Unable to release batch.'
       );
     } finally {
       setReleasingBatchId(null);
@@ -635,12 +674,12 @@ export function DailyBatchSelector({
                           {totalLeadsCount.toLocaleString()} dialed
                         </span>
                       </div>
-                      {isOwner && isInProgress && onReleaseBatch && (
+                      {isOwner && isInProgress && (
                         <button
                           type="button"
                           data-testid={`release-batch-btn-${batch.batchNumber}`}
                           disabled={releasingBatchId === batch.batchId}
-                          onClick={() => handleReleaseBatchClick(batch.batchId)}
+                          onClick={() => handleReleaseBatch(batch.batchId)}
                           className="px-2.5 py-1 rounded border border-slate-200 dark:border-white/15 bg-slate-50 hover:bg-slate-100 dark:bg-white/[0.04] dark:hover:bg-white/[0.09] text-[11px] font-medium text-slate-700 dark:text-slate-300 shrink-0 transition-colors cursor-pointer disabled:opacity-50"
                         >
                           {releasingBatchId === batch.batchId

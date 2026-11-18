@@ -1,6 +1,8 @@
 import {
+  deleteField,
   doc,
   setDoc,
+  updateDoc,
   writeBatch,
 } from 'firebase/firestore';
 import {
@@ -692,30 +694,57 @@ export function releaseBatchClaimPure(
 }
 
 /**
- * Persists a released (`AVAILABLE`) batch document to Firestore `batches/{batchId}`.
+ * Metadata-Only Batch Release (prevents UI hanging on large 5,000+ lead pools):
+ * Updates strictly the batch metadata in memory without looping through thousands of lead records.
+ */
+export function releaseBatchMetadataOnlyPure(
+  batchId: string,
+  batches: DailyBatchDocument[],
+  nowIso: string = new Date().toISOString()
+): {
+  releasedBatch: DailyBatchDocument | null;
+  updatedBatches: DailyBatchDocument[];
+} {
+  let releasedBatch: DailyBatchDocument | null = null;
+  const updatedBatches = batches.map((b) => {
+    if (b.batchId !== batchId) return b;
+    releasedBatch = {
+      ...b,
+      claimedByEmail: null,
+      claimedByName: null,
+      claimedAt: null,
+      status: 'AVAILABLE',
+      updatedAt: nowIso,
+    } as DailyBatchDocument;
+    return releasedBatch;
+  });
+  return { releasedBatch, updatedBatches };
+}
+
+/**
+ * Requirement 2: Metadata-Only Batch Release in Firestore (`batches/{batchId}`).
+ * Performs a single lightweight `updateDoc` strictly on the batch document without looping through individual lead documents.
  */
 export async function executeFirestoreBatchRelease(
   batchId: string,
-  fullBatchSnapshot?: DailyBatchDocument,
-  _unassignedLeadIds?: string[]
+  _fullBatchSnapshot?: DailyBatchDocument,
+  _unassignedLeadIds?: string[],
+  nowIso: string = new Date().toISOString()
 ): Promise<void> {
   if (!hasLiveReachFirebaseConfig()) return;
 
-  const payload = sanitizeFirestorePayload({
-    ...(fullBatchSnapshot || {}),
-    batchId,
-    status: 'AVAILABLE',
-    claimedByEmail: null,
-    claimedByName: null,
-    claimedAt: null,
-  });
-
   try {
-    const batchRef = doc(db, 'batches', batchId);
-    await setDoc(batchRef, payload, { merge: true });
-  } catch (err) {
-    reportCloudSyncError(err, 'executeFirestoreBatchRelease');
-    throw err;
+    await updateDoc(doc(db, 'batches', batchId), {
+      claimedByEmail: deleteField(),
+      claimedByName: deleteField(),
+      claimedAt: deleteField(),
+      status: 'AVAILABLE',
+      updatedAt: nowIso,
+    });
+  } catch (error) {
+    reportCloudSyncError(error, 'Release Batch');
+    console.error('Release Batch Failed:', error);
+    throw error;
   }
 }
 
