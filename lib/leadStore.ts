@@ -1362,6 +1362,10 @@ export function buildLeadCallStatusUpdatePayloadPure(params: {
   return {
     ...sanitizeFirestorePayload(params.updatedLead),
     status: effectiveStatus,
+    assignedBatchId:
+      effectiveStatus === 'FRESH' || effectiveStatus === 'REVIVED_FRESH'
+        ? params.updatedLead.assignedBatchId || null
+        : null,
     lastCalled: nowIso,
     lastCalledDate: params.updatedLead.lastCalledDate || nowIso,
     lastCalledBy: formattedRepShortName,
@@ -1644,32 +1648,6 @@ function matchesSearchQueryOnLead(lead: LeadRecord, q: string): boolean {
   return matchName || matchPhone || matchLoc;
 }
 
-function isCooldownExpiredForPriorityQueue(
-  lead: LeadRecord,
-  nowMs: number,
-  todayDate?: string
-): boolean {
-  if (todayDate && lead.lastCalledDate && lead.lastCalledDate.slice(0, 10) >= todayDate) {
-    return false;
-  }
-  if (lead.cooldownUntil) {
-    const cMs = new Date(lead.cooldownUntil).getTime();
-    if (!Number.isNaN(cMs)) {
-      return cMs <= nowMs;
-    }
-  }
-  if (
-    (lead.status === 'DIDNT_RECEIVE' || lead.status === 'SWITCH_OFF') &&
-    lead.lastCalledDate
-  ) {
-    const calledMs = new Date(lead.lastCalledDate).getTime();
-    if (!Number.isNaN(calledMs)) {
-      return calledMs + 48 * 60 * 60 * 1000 <= nowMs;
-    }
-  }
-  return true;
-}
-
 function isUntouchedFreshBatchLead(lead: LeadRecord): boolean {
   return (
     lead.status === 'FRESH' &&
@@ -1706,7 +1684,7 @@ function sortBatchQueueUntouchedFirstRetriesTail(
 
 /**
  * Pure query/filter engine for the Outreach Workspace tabs & Top Metric Card Inspectors:
- * 0. `🔥 To-Call Today` (`TO_CALL_TODAY`): Due follow-ups (`PROPOSAL_SHARED` & `FUTURE_REQUIREMENT`) + 48h cooldown-expired retries (`DIDNT_RECEIVE` & `SWITCH_OFF`)
+ * 0. `🔥 To-Call Today` (`TO_CALL_TODAY`): Strictly due/overdue warm follow-ups (`PROPOSAL_SHARED` & `FUTURE_REQUIREMENT`)
  * 1. `Today's Batch / Fresh` (`FRESH`)
  * 2. `All Leads & Attempt History` (`ALL_LEADS` — Owner Master Lead Table showing all leads with latest status updated)
  * 3. `Proposals Shared` (`PROPOSAL_SHARED`)
@@ -1743,7 +1721,6 @@ export function filterAndSortWorkspaceTableLeadsPure(
       ? selectedBatchIdFilter.trim()
       : null;
   const q = String(searchQuery || '').trim().toLowerCase();
-  const effectiveNowMs = nowIso ? new Date(nowIso).getTime() : Date.now();
 
   // Today's active (non-closed) batches
   const todayActiveBatches = batches
@@ -1762,9 +1739,17 @@ export function filterAndSortWorkspaceTableLeadsPure(
       ) || null
     : null;
 
-  // TAB 0: 🔥 To-Call Today (Follow-Ups & Cooldown-Expired Retries)
+  // TAB 0: 🔥 To-Call Today (Strictly Warm Follow-Ups: PROPOSAL_SHARED & FUTURE_REQUIREMENT due today or overdue)
+  // NEVER displays DIDNT_RECEIVE, SWITCH_OFF, or FRESH leads—even if their cooldown has expired.
   if (tab === 'TO_CALL_TODAY') {
     const priorityLeads = leads.filter((lead) => {
+      if (
+        lead.status !== 'PROPOSAL_SHARED' &&
+        lead.status !== 'FUTURE_REQUIREMENT'
+      ) {
+        return false;
+      }
+
       if (!matchesSearchQueryOnLead(lead, q)) return false;
 
       const belongsToRep = isOwner
@@ -1778,43 +1763,13 @@ export function filterAndSortWorkspaceTableLeadsPure(
             lead.assignedRepEmail || lead.lastCalledByEmail,
             userEmailLower,
             lead.assignedRepName || lead.lastCalledByName
-          ) ||
-          Boolean(
-            repClaimedTodayBatch &&
-              (lead.assignedBatchId === repClaimedTodayBatch.batchId ||
-                repClaimedTodayBatch.leadIds?.includes(lead.id))
           );
 
       if (!belongsToRep) return false;
 
-      // 1. PROPOSAL_SHARED due for follow-up today or overdue
-      if (lead.status === 'PROPOSAL_SHARED') {
-        if (!lead.nextFollowUpDate) return true;
-        return lead.nextFollowUpDate.slice(0, 10) <= todayDate;
-      }
-
-      // 2. FUTURE_REQUIREMENT due for follow-up today or overdue
-      if (lead.status === 'FUTURE_REQUIREMENT') {
-        if (!lead.nextFollowUpDate) return true;
-        return lead.nextFollowUpDate.slice(0, 10) <= todayDate;
-      }
-
-      // 3. DIDNT_RECEIVE or SWITCH_OFF (or revived FRESH with retry count > 0) whose 48h cooldown has expired
-      const isRetryCandidate =
-        lead.status === 'DIDNT_RECEIVE' ||
-        lead.status === 'SWITCH_OFF' ||
-        ((lead.status === 'FRESH' || lead.status === 'REVIVED_FRESH') &&
-          ((lead.didntReceiveCount || 0) > 0 || (lead.switchOffCount || 0) > 0));
-
-      if (
-        isRetryCandidate &&
-        (lead.didntReceiveCount || 0) < 10 &&
-        (lead.switchOffCount || 0) < 3
-      ) {
-        return isCooldownExpiredForPriorityQueue(lead, effectiveNowMs, todayDate);
-      }
-
-      return false;
+      // Due for follow-up today or overdue
+      if (!lead.nextFollowUpDate) return true;
+      return lead.nextFollowUpDate.slice(0, 10) <= todayDate;
     });
 
     const sortedPriority = [...priorityLeads].sort((a, b) => {
@@ -1835,7 +1790,7 @@ export function filterAndSortWorkspaceTableLeadsPure(
       todayActiveBatches,
       repClaimedTodayBatch,
       emptyStateMessage:
-        'No due follow-ups or cooldown-expired retry leads for today. Proceed to Today’s Batch / Fresh.',
+        'No due Proposal Shared or Future Requirement follow-ups for today. Proceed to Today’s Batch / Fresh.',
     };
   }
 

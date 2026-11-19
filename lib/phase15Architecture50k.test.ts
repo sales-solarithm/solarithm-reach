@@ -1684,8 +1684,8 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
     assert.equal(deadClosedRes.filteredLeads[0].id, 'lead-dead-1');
 
     // 3. Dedicated Rep Priority Tab: 🔥 To-Call Today (TO_CALL_TODAY)
-    // Includes PROPOSAL_SHARED due, FUTURE_REQUIREMENT due, and DIDNT_RECEIVE with expired 48h cooldown
-    // Excludes SWITCH_OFF still inside active 48h cooldown and PROPOSAL_SHARED not yet due
+    // Strictly includes ONLY PROPOSAL_SHARED due and FUTURE_REQUIREMENT due.
+    // NEVER displays DIDNT_RECEIVE, SWITCH_OFF, or FRESH leads—even if their cooldown has expired.
     const toCallTodayRepRes = filterAndSortWorkspaceTableLeadsPure({
       leads: sampleLeads,
       batches: [batchToday],
@@ -1697,9 +1697,10 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
     const toCallIds = toCallTodayRepRes.filteredLeads.map((l) => l.id);
     assert.ok(toCallIds.includes('lead-prop-due'));
     assert.ok(toCallIds.includes('lead-future-due'));
-    assert.ok(toCallIds.includes('lead-dr-expired'));
+    assert.ok(!toCallIds.includes('lead-dr-expired'));
     assert.ok(!toCallIds.includes('lead-so-active-cooldown'));
     assert.ok(!toCallIds.includes('lead-prop-not-due'));
+    assert.equal(toCallIds.length, 2);
 
     // 4. Comprehensive Owner Master Lead Table (ALL_LEADS): shows all leads in batch with latest status & attempt history
     const ownerAllBatchLeadsRes = filterAndSortWorkspaceTableLeadsPure({
@@ -2205,5 +2206,126 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
     assert.equal(afterLeadC.didntReceiveCount, 1);
     assert.equal(afterLeadC.switchOffCount, 1);
     assert.equal(afterLeadC.assignedBatchId, 'BATCH_2026_11_18_01');
+  });
+
+  it('32. Strict Queue Separation: 🔥 To-Call Today restricted strictly to PROPOSAL_SHARED & FUTURE_REQUIREMENT, and 2-Day Cooldown Holding returns DIDNT_RECEIVE / SWITCH_OFF directly to FRESH pool tail end after 48 hours', () => {
+    const repEmail = 'hastisavani.07@solarithmdesign.com';
+    const repName = 'Savani Hasti Vijaybhai';
+    const day1Iso = '2026-11-16T10:00:00.000Z';
+
+    // Day 1: Rep marks a FRESH lead as DIDNT_RECEIVE
+    const freshLead = {
+      ...makeFreshLead(6001),
+      id: 'lead-dr-6001',
+      status: 'FRESH' as const,
+      assignedBatchId: 'BATCH_2026_11_16_01',
+    };
+    const afterDrCall = applyCallDispositionUpdatePure(freshLead, {
+      newStatus: 'DIDNT_RECEIVE',
+      callDate: day1Iso,
+      notes: 'No answer on Day 1',
+      actorUser: { email: repEmail, name: repName, role: 'SALES' },
+      nowIso: day1Iso,
+    });
+    const firestorePayload = buildLeadCallStatusUpdatePayloadPure({
+      existingLead: freshLead,
+      updatedLead: afterDrCall,
+      newStatus: 'DIDNT_RECEIVE',
+      currentUser: { email: repEmail, name: repName },
+      nowIso: day1Iso,
+    });
+
+    assert.equal(afterDrCall.status, 'DIDNT_RECEIVE');
+    assert.equal(afterDrCall.assignedBatchId, null);
+    assert.equal(firestorePayload.assignedBatchId, null);
+    assert.equal(afterDrCall.cooldownUntil, '2026-11-18T10:00:00.000Z');
+    assert.equal(firestorePayload.lastCalled, day1Iso);
+    assert.equal(firestorePayload.lastCalledBy, 'Savani Hasti');
+
+    // Verify 🔥 To-Call Today NEVER includes DIDNT_RECEIVE, SWITCH_OFF, or revived FRESH leads (even when cooldown has expired!)
+    const expiredDrLead: LeadRecord = {
+      ...afterDrCall,
+      id: 'lead-dr-expired-6002',
+      status: 'DIDNT_RECEIVE',
+      cooldownUntil: '2026-11-17T00:00:00.000Z',
+    };
+    const expiredSoLead: LeadRecord = {
+      ...afterDrCall,
+      id: 'lead-so-expired-6003',
+      status: 'SWITCH_OFF',
+      switchOffCount: 1,
+      cooldownUntil: '2026-11-17T00:00:00.000Z',
+    };
+    const dueProposalLead: LeadRecord = {
+      ...makeFreshLead(6004),
+      id: 'lead-prop-due-6004',
+      status: 'PROPOSAL_SHARED',
+      assignedRepEmail: repEmail,
+      assignedRepName: repName,
+      nextFollowUpDate: '2026-11-18T00:00:00.000Z',
+    };
+    const dueFutureLead: LeadRecord = {
+      ...makeFreshLead(6005),
+      id: 'lead-fut-due-6005',
+      status: 'FUTURE_REQUIREMENT',
+      assignedRepEmail: repEmail,
+      assignedRepName: repName,
+      nextFollowUpDate: '2026-11-18T00:00:00.000Z',
+    };
+
+    const toCallResult = filterAndSortWorkspaceTableLeadsPure({
+      leads: [
+        afterDrCall,
+        expiredDrLead,
+        expiredSoLead,
+        dueProposalLead,
+        dueFutureLead,
+      ],
+      batches: [],
+      tab: 'TO_CALL_TODAY',
+      isOwner: false,
+      userEmail: repEmail,
+      todayDate: '2026-11-18',
+      nowIso: '2026-11-18T12:00:00.000Z',
+    });
+
+    assert.deepEqual(
+      toCallResult.filteredLeads.map((l) => l.id),
+      ['lead-prop-due-6004', 'lead-fut-due-6005']
+    );
+
+    // Day 3 (after 48 hours: 2026-11-18T12:00:00.000Z >= 2026-11-18T10:00:00.000Z):
+    // Daily reset returns `afterDrCall` directly to the universal FRESH pool with status === 'FRESH' and cooldownUntil === null,
+    // preserving callAttempts, didntReceiveCount, lastCalled, and lastCalledBy, placed at the tail end of the batch.
+    const untouchedDay3: LeadRecord = {
+      ...makeFreshLead(6010),
+      id: 'untouched-day3-6010',
+      status: 'FRESH',
+      callAttempts: 0,
+    };
+
+    const day3Partition = partitionFreshLeadsEquallyForActiveRepsPure(
+      [ { ...afterDrCall, lastCalled: day1Iso, lastCalledBy: 'Savani Hasti' }, untouchedDay3 ],
+      [],
+      1,
+      '2026-11-18',
+      '2026-11-18T12:00:00.000Z',
+      true
+    );
+
+    assert.equal(day3Partition.todayBatches.length, 1);
+    assert.deepEqual(day3Partition.todayBatches[0].leadIds, [
+      'untouched-day3-6010',
+      'lead-dr-6001',
+    ]);
+    const restoredLead = day3Partition.updatedLeads.find(
+      (l) => l.id === 'lead-dr-6001'
+    )!;
+    assert.equal(restoredLead.status, 'FRESH');
+    assert.equal(restoredLead.cooldownUntil, null);
+    assert.equal(restoredLead.callAttempts, 1);
+    assert.equal(restoredLead.didntReceiveCount, 1);
+    assert.equal(restoredLead.lastCalled, day1Iso);
+    assert.equal(restoredLead.lastCalledBy, 'Savani Hasti');
   });
 });

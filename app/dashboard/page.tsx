@@ -1007,6 +1007,61 @@ export default function DashboardPage() {
               return Array.from(map.values());
             });
           }
+        } else if (statusFilter === 'TO_CALL_TODAY') {
+          const [propSnap, futSnap] = await Promise.all([
+            getDocsFromServer(
+              query(
+                collection(db, 'leads'),
+                where('status', '==', 'PROPOSAL_SHARED'),
+                limit(50)
+              )
+            ).catch(() =>
+              getDocs(
+                query(
+                  collection(db, 'leads'),
+                  where('status', '==', 'PROPOSAL_SHARED'),
+                  limit(50)
+                )
+              )
+            ),
+            getDocsFromServer(
+              query(
+                collection(db, 'leads'),
+                where('status', '==', 'FUTURE_REQUIREMENT'),
+                limit(50)
+              )
+            ).catch(() =>
+              getDocs(
+                query(
+                  collection(db, 'leads'),
+                  where('status', '==', 'FUTURE_REQUIREMENT'),
+                  limit(50)
+                )
+              )
+            ),
+          ]);
+          if (!isMounted) return;
+          const fetched: LeadRecord[] = [];
+          propSnap?.forEach((d) => {
+            const record = { id: d.id, ...(d.data() as Omit<LeadRecord, 'id'>) };
+            if (!isLegacyMockOrSyntheticLead(record)) fetched.push(record);
+          });
+          futSnap?.forEach((d) => {
+            const record = { id: d.id, ...(d.data() as Omit<LeadRecord, 'id'>) };
+            if (!isLegacyMockOrSyntheticLead(record)) fetched.push(record);
+          });
+          if (fetched.length > 0) {
+            setLeads((prev) => {
+              const map = new Map<string, LeadRecord>();
+              for (const l of prev) {
+                if (!isLegacyMockOrSyntheticLead(l)) map.set(l.id, l);
+              }
+              for (const fl of fetched) {
+                map.set(fl.id, fl);
+              }
+              return Array.from(map.values());
+            });
+          }
         } else if (
           statusFilter === 'PROPOSAL_SHARED' ||
           statusFilter === 'FUTURE_REQUIREMENT' ||
