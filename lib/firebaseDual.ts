@@ -2,7 +2,7 @@ import { FirebaseApp, FirebaseOptions, getApps, initializeApp } from 'firebase/a
 import {
   Firestore,
   doc,
-  getDocFromServer,
+  getDoc,
   getFirestore,
   initializeFirestore,
   memoryLocalCache,
@@ -103,12 +103,14 @@ function getOrInitializeNamedApp(
 
 /**
  * Initializes Firestore with standard `memoryLocalCache()` ONLY (no IndexedDB offline queue)
- * so Browser 1 never masks failed cloud writes with local IndexedDB ghost state.
+ * and `experimentalAutoDetectLongPolling: true` so mobile browsers on cellular networks (Jio/Airtel)
+ * automatically fall back to HTTP long polling when WebChannel streams are throttled or dropped.
  */
 function getOrInitializeMemoryFirestore(app: FirebaseApp): Firestore {
   try {
     return initializeFirestore(app, {
       localCache: memoryLocalCache(),
+      experimentalAutoDetectLongPolling: true,
     });
   } catch {
     return getFirestore(app);
@@ -171,6 +173,7 @@ export interface CloudSyncErrorEvent {
   errorCode: string;
   errorMessage: string;
   operation: string;
+  guidanceHint: string;
   formattedBanner: string;
   timestamp: string;
 }
@@ -180,8 +183,52 @@ const cloudSyncErrorListeners = new Set<CloudSyncErrorListener>();
 let latestCloudSyncError: CloudSyncErrorEvent | null = null;
 
 /**
- * Surfaces any Firestore permission-denied or network write/read error to the UI alert banner:
- * `"Cloud Sync Error on project solarithm-tools-370ed: [error.code] — Check Firestore Rules"`
+ * Detects transient cellular/mobile network or WebChannel offline errors (`unavailable`, `client is offline`, etc.).
+ */
+export function isTransientNetworkOrOfflineFirestoreError(err: unknown): boolean {
+  const rawCode =
+    err && typeof err === 'object' && 'code' in err
+      ? String((err as { code?: unknown }).code).toLowerCase()
+      : '';
+  const rawMessage =
+    err instanceof Error
+      ? err.message.toLowerCase()
+      : err && typeof err === 'object' && 'message' in err
+      ? String((err as { message?: unknown }).message).toLowerCase()
+      : String(err || '').toLowerCase();
+
+  return (
+    rawCode.includes('unavailable') ||
+    rawCode.includes('deadline-exceeded') ||
+    rawCode.includes('cancelled') ||
+    rawMessage.includes('client is offline') ||
+    rawMessage.includes('unavailable') ||
+    rawMessage.includes('network')
+  );
+}
+
+/**
+ * Executes a Firestore read/check operation with a single lightweight retry (~1.5s delay)
+ * when a transient mobile network or `unavailable` offline error occurs.
+ */
+export async function withFirestoreNetworkRetry<T>(
+  operationFn: () => Promise<T>,
+  retryDelayMs: number = 1500
+): Promise<T> {
+  try {
+    return await operationFn();
+  } catch (err) {
+    if (isTransientNetworkOrOfflineFirestoreError(err)) {
+      await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+      return await operationFn();
+    }
+    throw err;
+  }
+}
+
+/**
+ * Surfaces any Firestore permission-denied or network write/read error to the UI alert banner,
+ * accurately distinguishing network/offline connectivity issues from actual `permission-denied` rule errors.
  */
 export function reportCloudSyncError(
   err: unknown,
@@ -200,13 +247,30 @@ export function reportCloudSyncError(
 
   const errorCode = rawCode || rawMessage || 'firestore/error';
   const projectId = String(REACH_FIREBASE_CONFIG.projectId || 'solarithm-tools-370ed');
-  const formattedBanner = `Cloud Sync Error on project ${projectId}: ${errorCode} (${operation}) — Check Firestore Rules`;
+
+  const lowerCode = errorCode.toLowerCase();
+  const lowerMsg = rawMessage.toLowerCase();
+  const isPermissionError =
+    lowerCode.includes('permission-denied') ||
+    lowerCode.includes('unauthenticated') ||
+    lowerMsg.includes('missing or insufficient permissions') ||
+    lowerMsg.includes('permission_denied');
+  const isNetworkOfflineError = isTransientNetworkOrOfflineFirestoreError(err);
+
+  const guidanceHint = isPermissionError
+    ? 'Check Firestore Rules'
+    : isNetworkOfflineError
+    ? 'Network / Offline Connectivity Issue (Check Internet or Cellular Connection)'
+    : 'Check Network Connection or Firestore Rules';
+
+  const formattedBanner = `Cloud Sync Error on project ${projectId}: ${errorCode} — ${guidanceHint}`;
 
   const event: CloudSyncErrorEvent = {
     projectId,
     errorCode,
     errorMessage: rawMessage,
     operation,
+    guidanceHint,
     formattedBanner,
     timestamp: new Date().toISOString(),
   };
@@ -250,7 +314,8 @@ export function subscribeToCloudSyncErrors(
 }
 
 /**
- * Verifies live cloud server connectivity (`getDocFromServer`) against `solarithm-tools-370ed`.
+ * Verifies live cloud server connectivity (`getDoc` with `memoryLocalCache()` + 1.5s retry)
+ * against `solarithm-tools-370ed`.
  */
 export async function verifyReachCloudConnectionFromServer(): Promise<{
   connected: boolean;
@@ -260,7 +325,11 @@ export async function verifyReachCloudConnectionFromServer(): Promise<{
 }> {
   const projectId = String(REACH_FIREBASE_CONFIG.projectId || 'solarithm-tools-370ed');
   try {
-    await getDocFromServer(doc(reachDb, 'system_meta', 'daily_state'));
+    await withFirestoreNetworkRetry(
+      () => getDoc(doc(reachDb, 'system_meta', 'daily_state')),
+      1500
+    );
+    clearCloudSyncError();
     return {
       connected: true,
       projectId,

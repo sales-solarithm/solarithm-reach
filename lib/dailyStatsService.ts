@@ -5,7 +5,6 @@ import {
   doc,
   getCountFromServer,
   getDocs,
-  getDocsFromServer,
   increment,
   limit,
   query,
@@ -18,6 +17,7 @@ import {
   hasLiveReachFirebaseConfig,
   reachDb,
   reportCloudSyncError,
+  withFirestoreNetworkRetry,
 } from './firebaseDual';
 import { CANONICAL_NEXUS_EMPLOYEES } from './authService';
 import { OwnerMetricStripData } from './dashboardMetrics';
@@ -373,8 +373,9 @@ export async function fetchDailyStatsFromFirestore(): Promise<DailyRepStatRecord
     return [];
   }
   try {
-    const snap = await getDocsFromServer(collection(reachDb, 'daily_stats')).catch(
-      () => getDocs(collection(reachDb, 'daily_stats'))
+    const snap = await withFirestoreNetworkRetry(
+      () => getDocs(collection(reachDb, 'daily_stats')),
+      1500
     );
     const list: DailyRepStatRecord[] = [];
     snap.forEach((d) => {

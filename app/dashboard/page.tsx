@@ -7,7 +7,6 @@ import {
   deleteField,
   doc,
   getDocs,
-  getDocsFromServer,
   limit,
   onSnapshot,
   query,
@@ -20,6 +19,7 @@ import {
   reachDb as db,
   reportCloudSyncError,
   subscribeToCloudSyncErrors,
+  withFirestoreNetworkRetry,
 } from '@/lib/firebaseDual';
 import { useAuth } from '@/context/AuthContext';
 import { LoginModal } from '@/components/auth/LoginModal';
@@ -986,7 +986,7 @@ export default function DashboardPage() {
             where('assignedBatchId', '==', targetBatchId),
             limit(50)
           );
-          const snap = await getDocsFromServer(q).catch(() => getDocs(q));
+          const snap = await withFirestoreNetworkRetry(() => getDocs(q), 1500);
           if (!isMounted || !snap || snap.empty) return;
           const fetched: LeadRecord[] = [];
           snap.forEach((d) => {
@@ -1008,38 +1008,26 @@ export default function DashboardPage() {
             });
           }
         } else if (statusFilter === 'TO_CALL_TODAY') {
-          const [propSnap, futSnap] = await Promise.all([
-            getDocsFromServer(
-              query(
-                collection(db, 'leads'),
-                where('status', '==', 'PROPOSAL_SHARED'),
-                limit(50)
-              )
-            ).catch(() =>
-              getDocs(
-                query(
-                  collection(db, 'leads'),
-                  where('status', '==', 'PROPOSAL_SHARED'),
-                  limit(50)
-                )
-              )
-            ),
-            getDocsFromServer(
-              query(
-                collection(db, 'leads'),
-                where('status', '==', 'FUTURE_REQUIREMENT'),
-                limit(50)
-              )
-            ).catch(() =>
-              getDocs(
-                query(
-                  collection(db, 'leads'),
-                  where('status', '==', 'FUTURE_REQUIREMENT'),
-                  limit(50)
-                )
-              )
-            ),
-          ]);
+          const [propSnap, futSnap] = await withFirestoreNetworkRetry(
+            () =>
+              Promise.all([
+                getDocs(
+                  query(
+                    collection(db, 'leads'),
+                    where('status', '==', 'PROPOSAL_SHARED'),
+                    limit(50)
+                  )
+                ),
+                getDocs(
+                  query(
+                    collection(db, 'leads'),
+                    where('status', '==', 'FUTURE_REQUIREMENT'),
+                    limit(50)
+                  )
+                ),
+              ]),
+            1500
+          );
           if (!isMounted) return;
           const fetched: LeadRecord[] = [];
           propSnap?.forEach((d) => {
@@ -1072,7 +1060,7 @@ export default function DashboardPage() {
             where('status', '==', statusFilter),
             limit(50)
           );
-          const snap = await getDocsFromServer(q).catch(() => getDocs(q));
+          const snap = await withFirestoreNetworkRetry(() => getDocs(q), 1500);
           if (!isMounted || !snap || snap.empty) return;
           const fetched: LeadRecord[] = [];
           snap.forEach((d) => {
@@ -1240,8 +1228,7 @@ export default function DashboardPage() {
               <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
               <div className="space-y-0.5 min-w-0 break-words">
                 <div className="font-bold">
-                  Cloud Sync Error on project {cloudSyncError.projectId}:{' '}
-                  {cloudSyncError.errorCode} — Check Firestore Rules
+                  {cloudSyncError.formattedBanner}
                 </div>
                 <div className="text-[11px] opacity-90">
                   Operation: {cloudSyncError.operation} · {cloudSyncError.errorMessage}

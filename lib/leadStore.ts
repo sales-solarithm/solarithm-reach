@@ -3,7 +3,6 @@ import {
   doc,
   getDoc,
   getDocs,
-  getDocsFromServer,
   increment,
   query,
   setDoc,
@@ -14,6 +13,7 @@ import {
   hasLiveReachFirebaseConfig,
   reachDb as db,
   reportCloudSyncError,
+  withFirestoreNetworkRetry,
 } from './firebaseDual';
 import {
   AuthorizedUser,
@@ -218,8 +218,9 @@ export function saveLocalBatches(_batches: BatchRecord[]): void {
 export async function fetchAllLeadsFromServerFirestore(): Promise<LeadRecord[]> {
   if (!hasLiveReachFirebaseConfig()) return [];
   try {
-    const snap = await getDocsFromServer(collection(db, 'leads')).catch(() =>
-      getDocs(collection(db, 'leads'))
+    const snap = await withFirestoreNetworkRetry(
+      () => getDocs(collection(db, 'leads')),
+      1500
     );
     const list: LeadRecord[] = [];
     snap.forEach((d) => {
@@ -241,13 +242,14 @@ export async function fetchAllLeadsFromServerFirestore(): Promise<LeadRecord[]> 
 }
 
 /**
- * Fetches all batches directly from the live Cloud Firestore server (`getDocsFromServer`).
+ * Fetches all batches directly from the live Cloud Firestore server (`getDocs` with `memoryLocalCache()` + 1.5s retry).
  */
 export async function fetchAllBatchesFromServerFirestore(): Promise<BatchRecord[]> {
   if (!hasLiveReachFirebaseConfig()) return [];
   try {
-    const snap = await getDocsFromServer(collection(db, 'batches')).catch(() =>
-      getDocs(collection(db, 'batches'))
+    const snap = await withFirestoreNetworkRetry(
+      () => getDocs(collection(db, 'batches')),
+      1500
     );
     const list: BatchRecord[] = [];
     snap.forEach((d) => {

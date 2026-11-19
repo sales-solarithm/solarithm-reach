@@ -51,6 +51,12 @@ import {
 } from '../components/batches/DailyBatchSelector';
 import { getTodayIstDateString } from '../types/batch';
 import { CANONICAL_NEXUS_EMPLOYEES } from './authService';
+import {
+  clearCloudSyncError,
+  isTransientNetworkOrOfflineFirestoreError,
+  reportCloudSyncError,
+  withFirestoreNetworkRetry,
+} from './firebaseDual';
 import { BatchRecord, LeadRecord, SanitizedRowItem } from './types';
 
 function makeFreshLead(idx: number): LeadRecord {
@@ -2327,5 +2333,50 @@ describe('Comprehensive Architecture Fix: 50k+ Lead Performance, Auto-Equal Batc
     assert.equal(restoredLead.didntReceiveCount, 1);
     assert.equal(restoredLead.lastCalled, day1Iso);
     assert.equal(restoredLead.lastCalledBy, 'Savani Hasti');
+  });
+
+  it('33. Mobile Network Resilience: withFirestoreNetworkRetry recovers from transient unavailable/offline errors and reportCloudSyncError distinguishes network issues from permission-denied rules', async () => {
+    const transientErr = Object.assign(
+      new Error('Failed to get document because the client is offline.'),
+      { code: 'unavailable' }
+    );
+    assert.equal(isTransientNetworkOrOfflineFirestoreError(transientErr), true);
+
+    let callCount = 0;
+    const result = await withFirestoreNetworkRetry(async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        throw transientErr;
+      }
+      return 'recovered-on-retry';
+    }, 5);
+
+    assert.equal(result, 'recovered-on-retry');
+    assert.equal(callCount, 2);
+
+    const netEvent = reportCloudSyncError(
+      transientErr,
+      'Daily Batch Reset & Partition Engine'
+    );
+    assert.ok(
+      netEvent.formattedBanner.includes('Network / Offline Connectivity Issue'),
+      'Unavailable error banner must clearly indicate a Network / Offline Connectivity Issue'
+    );
+    assert.ok(
+      !netEvent.formattedBanner.endsWith('Check Firestore Rules'),
+      'Unavailable error banner must not falsely blame Firestore Rules'
+    );
+
+    const permErr = Object.assign(
+      new Error('Missing or insufficient permissions.'),
+      { code: 'permission-denied' }
+    );
+    const permEvent = reportCloudSyncError(permErr, 'Lead Status Update');
+    assert.ok(
+      permEvent.formattedBanner.includes('Check Firestore Rules'),
+      'Permission-denied error banner must instruct to Check Firestore Rules'
+    );
+
+    clearCloudSyncError();
   });
 });

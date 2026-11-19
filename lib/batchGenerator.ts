@@ -2,18 +2,18 @@ import {
   collection,
   doc,
   getDoc,
-  getDocFromServer,
   getDocs,
-  getDocsFromServer,
   query,
   setDoc,
   where,
   writeBatch,
 } from 'firebase/firestore';
 import {
+  clearCloudSyncError,
   hasLiveReachFirebaseConfig,
   reachDb as db,
   reportCloudSyncError,
+  withFirestoreNetworkRetry,
 } from './firebaseDual';
 import { getActiveSalesReps } from './employeeQueries';
 import { sanitizeFirestorePayload } from './firestoreSanitizer';
@@ -771,32 +771,29 @@ export async function autoSweepStaleBatchesAndGenerateTodayBatchesFirestore(
       freshLeadsSnap,
       didntReceiveSnap,
       switchOffSnap,
-    ] = await Promise.all([
-      getDocFromServer(dailyStateRef).catch(() => getDoc(dailyStateRef)),
-      getActiveSalesReps().catch(() => []),
-      getDocsFromServer(collection(db, 'batches')).catch(() =>
-        getDocs(collection(db, 'batches'))
-      ),
-      getDocsFromServer(
-        query(collection(db, 'leads'), where('status', '==', 'FRESH'))
-      ).catch(() =>
-        getDocs(query(collection(db, 'leads'), where('status', '==', 'FRESH')))
-      ),
-      getDocsFromServer(
-        query(collection(db, 'leads'), where('status', '==', 'DIDNT_RECEIVE'))
-      ).catch(() =>
-        getDocs(
-          query(collection(db, 'leads'), where('status', '==', 'DIDNT_RECEIVE'))
-        )
-      ),
-      getDocsFromServer(
-        query(collection(db, 'leads'), where('status', '==', 'SWITCH_OFF'))
-      ).catch(() =>
-        getDocs(
-          query(collection(db, 'leads'), where('status', '==', 'SWITCH_OFF'))
-        )
-      ),
-    ]);
+    ] = await withFirestoreNetworkRetry(
+      () =>
+        Promise.all([
+          getDoc(dailyStateRef).catch(() => null),
+          getActiveSalesReps().catch(() => []),
+          getDocs(collection(db, 'batches')),
+          getDocs(
+            query(collection(db, 'leads'), where('status', '==', 'FRESH'))
+          ),
+          getDocs(
+            query(
+              collection(db, 'leads'),
+              where('status', '==', 'DIDNT_RECEIVE')
+            )
+          ),
+          getDocs(
+            query(collection(db, 'leads'), where('status', '==', 'SWITCH_OFF'))
+          ),
+        ]),
+      1500
+    );
+
+    clearCloudSyncError();
 
     const activeRepCount = Math.max(1, activeReps.length || 3);
 
